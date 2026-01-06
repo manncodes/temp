@@ -1,6 +1,8 @@
 """
 Generate difficulty + progressive hints for POPE-style RL training.
-Usage: python hint_generator.py train.parquet train_enriched.parquet --base-url http://0.0.0.0:8000/v1
+Uses continuous batching to keep vLLM saturated. Saves checkpoints as chunk files.
+
+Usage: python hint_generator.py train.parquet output_dir/ --base-url http://0.0.0.0:8000/v1
 """
 
 import asyncio
@@ -8,11 +10,11 @@ import json
 import time
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from typing import List, Optional, Dict, Any, AsyncIterator
+from pathlib import Path
 
 from pydantic import BaseModel, Field
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from tqdm import tqdm
 
 if "KUBERNETES_SERVICE_HOST" in os.environ:
@@ -52,59 +54,53 @@ class Result:
 
 
 class HintGenerator:
+    """Continuous batching hint generator - keeps vLLM saturated."""
+
     def __init__(
         self,
         base_url: str = "http://0.0.0.0:8000/v1",
         api_key: str = "dummy",
         model: Optional[str] = None,
-        max_concurrent: int = 64,
-        timeout: float = 60.0,
+        max_concurrent: int = 128,
+        timeout: float = 120.0,
         max_retries: int = 2,
     ):
-        self.base_url = base_url
-        self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
         self.max_concurrent = max_concurrent
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+        self.model = model
 
-        self._sync = OpenAI(base_url=base_url, api_key=api_key)
-        self._async: Optional[AsyncOpenAI] = None
-        self.model = model or self._detect_model()
-
-    def _detect_model(self) -> str:
-        try:
-            return self._sync.models.list().data[0].id
-        except Exception:
-            return "unknown"
-
-    def _get_async(self) -> AsyncOpenAI:
-        if not self._async:
-            self._async = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key, timeout=self.timeout)
-        return self._async
+    async def _init_model(self):
+        if not self.model:
+            try:
+                models = await self.client.models.list()
+                self.model = models.data[0].id
+            except Exception:
+                self.model = "unknown"
 
     def _make_prompt(self, problem: str, solution: str) -> str:
         return f"## Problem\n{problem}\n\n## Reference Solution\n{solution}"
 
-    async def _generate_one(self, problem: str, solution: str, idx: int, sem: asyncio.Semaphore) -> Result:
+    async def _generate_one(self, problem: str, solution: str, idx: int) -> Result:
         for attempt in range(self.max_retries + 1):
             try:
-                async with sem:
-                    resp = await asyncio.wait_for(
-                        self._get_async().beta.chat.completions.parse(
-                            model=self.model,
-                            messages=[
-                                {"role": "system", "content": SYSTEM_PROMPT},
-                                {"role": "user", "content": self._make_prompt(problem, solution)},
-                            ],
-                            response_format=ProgressiveHints,
-                            temperature=0.7,
-                        ),
-                        timeout=self.timeout,
-                    )
-                    parsed = resp.choices[0].message.parsed
-                    if parsed:
-                        return Result(idx, parsed)
-                    raise ValueError("Parse failed")
+                resp = await asyncio.wait_for(
+                    self.client.beta.chat.completions.parse(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": self._make_prompt(problem, solution)},
+                        ],
+                        response_format=ProgressiveHints,
+                        temperature=0.7,
+                    ),
+                    timeout=self.timeout,
+                )
+                parsed = resp.choices[0].message.parsed
+                if parsed:
+                    return Result(idx, parsed)
+                raise ValueError("Parse failed")
             except asyncio.CancelledError:
                 return Result(idx, None, "cancelled")
             except Exception as e:
@@ -113,72 +109,46 @@ class HintGenerator:
                 await asyncio.sleep(0.5 * (2 ** attempt))
         return Result(idx, None, "exhausted retries")
 
-    async def generate_batch_async(
-        self, problems: List[str], solutions: List[str], show_progress: bool = True
-    ) -> List[Result]:
+    async def generate_continuous(
+        self,
+        problems: List[str],
+        solutions: List[str],
+        pbar: Optional[tqdm] = None,
+    ) -> AsyncIterator[Result]:
+        """
+        Continuous batching: maintains max_concurrent in-flight requests.
+        Yields results as they complete, immediately backfilling with new requests.
+        """
+        await self._init_model()
         n = len(problems)
-        sem = asyncio.Semaphore(self.max_concurrent)
-        tasks = [
-            asyncio.create_task(self._generate_one(p, s, i, sem))
-            for i, (p, s) in enumerate(zip(problems, solutions))
-        ]
+        next_idx = 0
+        pending: Dict[asyncio.Task, int] = {}
 
-        results: Dict[int, Result] = {}
-        pbar = tqdm(total=n, desc="Generating hints", disable=not show_progress)
+        def submit(idx: int) -> asyncio.Task:
+            task = asyncio.create_task(self._generate_one(problems[idx], solutions[idx], idx))
+            pending[task] = idx
+            return task
 
-        pending = set(tasks)
+        # Initial fill
+        while next_idx < n and len(pending) < self.max_concurrent:
+            submit(next_idx)
+            next_idx += 1
+
+        # Process as they complete, backfill immediately
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                r = t.result()
-                results[r.index] = r
-                pbar.update(1)
-        pbar.close()
+            done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
 
-        return [results[i] for i in range(n)]
+            for task in done:
+                del pending[task]
+                result = task.result()
+                if pbar:
+                    pbar.update(1)
+                yield result
 
-    def generate_batch(self, problems: List[str], solutions: List[str], **kw) -> List[Result]:
-        try:
-            asyncio.get_running_loop()
-            return self._generate_batch_sync(problems, solutions, **kw)
-        except RuntimeError:
-            return asyncio.run(self.generate_batch_async(problems, solutions, **kw))
-
-    def _generate_batch_sync(self, problems: List[str], solutions: List[str], show_progress: bool = True) -> List[Result]:
-        n = len(problems)
-        results: Dict[int, Result] = {}
-
-        def worker(idx: int) -> Result:
-            for attempt in range(self.max_retries + 1):
-                try:
-                    resp = self._sync.beta.chat.completions.parse(
-                        model=self.model,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": self._make_prompt(problems[idx], solutions[idx])},
-                        ],
-                        response_format=ProgressiveHints,
-                        temperature=0.7,
-                    )
-                    parsed = resp.choices[0].message.parsed
-                    if parsed:
-                        return Result(idx, parsed)
-                except Exception as e:
-                    if attempt == self.max_retries:
-                        return Result(idx, None, str(e))
-                    time.sleep(0.5 * (2 ** attempt))
-            return Result(idx, None, "exhausted")
-
-        with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
-            futures = {pool.submit(worker, i): i for i in range(n)}
-            pbar = tqdm(total=n, desc="Generating hints", disable=not show_progress)
-            for f in as_completed(futures):
-                r = f.result()
-                results[r.index] = r
-                pbar.update(1)
-            pbar.close()
-
-        return [results[i] for i in range(n)]
+                # Backfill: submit next request immediately
+                if next_idx < n:
+                    submit(next_idx)
+                    next_idx += 1
 
 
 def extract_problem(row: Dict[str, Any]) -> str:
@@ -198,57 +168,176 @@ def extract_solution(row: Dict[str, Any]) -> str:
     return str(rm) if rm else ""
 
 
-def enrich_parquet(input_path: str, output_path: str, generator: HintGenerator, batch_size: int = 1000):
+async def enrich_parquet(
+    input_path: str,
+    output_dir: str,
+    generator: HintGenerator,
+    chunk_size: int = 1000,
+):
     import pandas as pd
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_parquet(input_path)
     n = len(df)
     print(f"Loaded {n} rows from {input_path}")
 
-    problems = [extract_problem(df.iloc[i].to_dict()) for i in range(n)]
-    solutions = [extract_solution(df.iloc[i].to_dict()) for i in range(n)]
+    # Pre-extract all problems/solutions
+    rows = [df.iloc[i].to_dict() for i in range(n)]
+    problems = [extract_problem(r) for r in rows]
+    solutions = [extract_solution(r) for r in rows]
 
+    # Track results by index
+    results: Dict[int, Result] = {}
+    success_count = 0
+    chunk_idx = 0
+    last_saved = 0
+
+    def save_chunk(start: int, end: int):
+        """Save a chunk of results to JSONL."""
+        nonlocal chunk_idx
+        chunk_path = output_dir / f"chunk_{chunk_idx:04d}.jsonl"
+        with open(chunk_path, "w") as f:
+            for i in range(start, end):
+                if i not in results:
+                    continue
+                r = results[i]
+                row = rows[i].copy()
+                row["estimated_difficulty"] = r.hints.estimated_difficulty if r.success else None
+                row["hints"] = r.hints.hints if r.success else None
+                row["hint_generation_success"] = r.success
+                if not r.success:
+                    row["hint_generation_error"] = r.error
+                f.write(json.dumps(row, default=str) + "\n")
+        print(f"\nSaved {chunk_path} ({end - start} rows)")
+        chunk_idx += 1
+
+    # Global progress bar across entire dataset
+    pbar = tqdm(total=n, desc="Generating hints", unit="row")
+
+    async for result in generator.generate_continuous(problems, solutions, pbar):
+        results[result.index] = result
+        if result.success:
+            success_count += 1
+
+        # Save chunk when we have chunk_size completed results in order
+        # Find how many consecutive results we have from last_saved
+        while last_saved in results:
+            last_saved += 1
+
+        # Save when we have a full chunk of consecutive results
+        completed_consecutive = last_saved
+        if completed_consecutive > 0 and completed_consecutive % chunk_size == 0:
+            chunk_start = completed_consecutive - chunk_size
+            save_chunk(chunk_start, completed_consecutive)
+
+    pbar.close()
+
+    # Save remaining results
+    if last_saved % chunk_size != 0:
+        chunk_start = (last_saved // chunk_size) * chunk_size
+        save_chunk(chunk_start, last_saved)
+
+    # Also save complete parquet
     all_diff, all_hints, all_ok, all_err = [], [], [], []
-    success = 0
-
-    for batch_start in range(0, n, batch_size):
-        batch_end = min(batch_start + batch_size, n)
-        results = generator.generate_batch(
-            problems[batch_start:batch_end],
-            solutions[batch_start:batch_end],
-        )
-        for r in results:
-            if r.success:
-                all_diff.append(r.hints.estimated_difficulty)
-                all_hints.append(json.dumps(r.hints.hints))
-                all_ok.append(True)
-                all_err.append(None)
-                success += 1
-            else:
-                all_diff.append(None)
-                all_hints.append(None)
-                all_ok.append(False)
-                all_err.append(r.error)
+    for i in range(n):
+        r = results.get(i)
+        if r and r.success:
+            all_diff.append(r.hints.estimated_difficulty)
+            all_hints.append(json.dumps(r.hints.hints))
+            all_ok.append(True)
+            all_err.append(None)
+        else:
+            all_diff.append(None)
+            all_hints.append(None)
+            all_ok.append(False)
+            all_err.append(r.error if r else "missing")
 
     df["estimated_difficulty"] = all_diff
     df["hints"] = all_hints
     df["hint_generation_success"] = all_ok
     df["hint_generation_error"] = all_err
 
-    df.to_parquet(output_path, index=False)
-    print(f"Done: {success}/{n} ({100*success/n:.1f}%) -> {output_path}")
+    final_path = output_dir / "enriched.parquet"
+    df.to_parquet(final_path, index=False)
+    print(f"\nDone: {success_count}/{n} ({100*success_count/n:.1f}%)")
+    print(f"Saved: {final_path}")
+
+
+async def enrich_jsonl(
+    input_path: str,
+    output_dir: str,
+    generator: HintGenerator,
+    chunk_size: int = 1000,
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(input_path) as f:
+        data = [json.loads(line) for line in f if line.strip()]
+
+    n = len(data)
+    print(f"Loaded {n} rows from {input_path}")
+
+    problems = [extract_problem(d) for d in data]
+    solutions = [extract_solution(d) for d in data]
+
+    results: Dict[int, Result] = {}
+    success_count = 0
+    chunk_idx = 0
+    last_saved = 0
+
+    def save_chunk(start: int, end: int):
+        nonlocal chunk_idx
+        chunk_path = output_dir / f"chunk_{chunk_idx:04d}.jsonl"
+        with open(chunk_path, "w") as f:
+            for i in range(start, end):
+                if i not in results:
+                    continue
+                r = results[i]
+                row = data[i].copy()
+                row["estimated_difficulty"] = r.hints.estimated_difficulty if r.success else None
+                row["hints"] = r.hints.hints if r.success else None
+                row["hint_generation_success"] = r.success
+                if not r.success:
+                    row["hint_generation_error"] = r.error
+                f.write(json.dumps(row, default=str) + "\n")
+        print(f"\nSaved {chunk_path}")
+        chunk_idx += 1
+
+    pbar = tqdm(total=n, desc="Generating hints", unit="row")
+
+    async for result in generator.generate_continuous(problems, solutions, pbar):
+        results[result.index] = result
+        if result.success:
+            success_count += 1
+
+        while last_saved in results:
+            last_saved += 1
+
+        if last_saved > 0 and last_saved % chunk_size == 0:
+            save_chunk(last_saved - chunk_size, last_saved)
+
+    pbar.close()
+
+    if last_saved % chunk_size != 0:
+        save_chunk((last_saved // chunk_size) * chunk_size, last_saved)
+
+    print(f"\nDone: {success_count}/{n} ({100*success_count/n:.1f}%)")
 
 
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("input_file")
-    p.add_argument("output_file")
+    p.add_argument("input_file", help="Input parquet or JSONL")
+    p.add_argument("output_dir", help="Output directory for chunks and final parquet")
     p.add_argument("--base-url", default="http://0.0.0.0:8000/v1")
     p.add_argument("--api-key", default="dummy")
     p.add_argument("--model", default=None)
-    p.add_argument("--max-concurrent", type=int, default=64)
-    p.add_argument("--batch-size", type=int, default=1000)
+    p.add_argument("--max-concurrent", type=int, default=128, help="In-flight requests (keep high for vLLM)")
+    p.add_argument("--chunk-size", type=int, default=1000, help="Save checkpoint every N rows")
+    p.add_argument("--timeout", type=float, default=120.0)
     args = p.parse_args()
 
     gen = HintGenerator(
@@ -256,27 +345,13 @@ def main():
         api_key=args.api_key,
         model=args.model,
         max_concurrent=args.max_concurrent,
+        timeout=args.timeout,
     )
 
     if args.input_file.endswith(".parquet"):
-        enrich_parquet(args.input_file, args.output_file, gen, args.batch_size)
+        asyncio.run(enrich_parquet(args.input_file, args.output_dir, gen, args.chunk_size))
     else:
-        # JSONL
-        with open(args.input_file) as f:
-            data = [json.loads(line) for line in f if line.strip()]
-
-        problems = [extract_problem(d) for d in data]
-        solutions = [extract_solution(d) for d in data]
-        results = gen.generate_batch(problems, solutions)
-
-        with open(args.output_file, "w") as f:
-            for orig, r in zip(data, results):
-                orig["estimated_difficulty"] = r.hints.estimated_difficulty if r.success else None
-                orig["hints"] = r.hints.hints if r.success else None
-                orig["hint_generation_success"] = r.success
-                if not r.success:
-                    orig["hint_generation_error"] = r.error
-                f.write(json.dumps(orig) + "\n")
+        asyncio.run(enrich_jsonl(args.input_file, args.output_dir, gen, args.chunk_size))
 
 
 if __name__ == "__main__":
