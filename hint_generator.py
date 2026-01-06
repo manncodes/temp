@@ -28,7 +28,7 @@ class ProgressiveHints(BaseModel):
     hints: List[str] = Field(min_length=5, max_length=5)
 
 
-SYSTEM_PROMPT = '''Generate difficulty (1-10) and 5 progressive hints for this problem.
+SYSTEM_PROMPT_WITH_SOLUTION = '''Generate difficulty (1-10) and 5 progressive hints for this problem.
 
 Difficulty: 1-2 trivial, 3-4 standard, 5-6 needs insight, 7-8 multiple insights, 9-10 competition-level.
 
@@ -38,6 +38,20 @@ Hints must be strictly progressive:
 3. Key Insight: The "aha" moment ("dp[i] = max(dp[i-1], dp[i-2] + val[i])")
 4. Structure: Solution outline with steps
 5. Near-Complete: Everything except final computation
+
+Rules: Hint 1 must not enable solving. Hint 5 makes it trivial. 1-3 sentences each. JSON only.'''
+
+SYSTEM_PROMPT_NO_SOLUTION = '''Generate difficulty (1-10) and 5 progressive hints for this problem.
+You must infer the solution approach from the problem statement.
+
+Difficulty: 1-2 trivial, 3-4 standard, 5-6 needs insight, 7-8 multiple insights, 9-10 competition-level.
+
+Hints must be strictly progressive:
+1. Orientation: Problem type only ("This is a DP problem")
+2. Approach: General technique ("Use memoization")
+3. Key Insight: The core realization needed
+4. Structure: Solution outline with steps
+5. Near-Complete: Detailed approach, just needs implementation
 
 Rules: Hint 1 must not enable solving. Hint 5 makes it trivial. 1-3 sentences each. JSON only.'''
 
@@ -79,18 +93,28 @@ class HintGenerator:
             except Exception:
                 self.model = "unknown"
 
-    def _make_prompt(self, problem: str, solution: str) -> str:
-        return f"## Problem\n{problem}\n\n## Reference Solution\n{solution}"
+    def _make_prompt(self, problem: str, solution: Optional[str]) -> tuple[str, str]:
+        """Returns (system_prompt, user_prompt)."""
+        if solution:
+            return (
+                SYSTEM_PROMPT_WITH_SOLUTION,
+                f"## Problem\n{problem}\n\n## Reference Solution\n{solution}",
+            )
+        return (
+            SYSTEM_PROMPT_NO_SOLUTION,
+            f"## Problem\n{problem}",
+        )
 
-    async def _generate_one(self, problem: str, solution: str, idx: int) -> Result:
+    async def _generate_one(self, problem: str, solution: Optional[str], idx: int) -> Result:
+        system_prompt, user_prompt = self._make_prompt(problem, solution)
         for attempt in range(self.max_retries + 1):
             try:
                 resp = await asyncio.wait_for(
                     self.client.beta.chat.completions.parse(
                         model=self.model,
                         messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": self._make_prompt(problem, solution)},
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
                         ],
                         response_format=ProgressiveHints,
                         temperature=0.7,
@@ -112,7 +136,7 @@ class HintGenerator:
     async def generate_continuous(
         self,
         problems: List[str],
-        solutions: List[str],
+        solutions: List[Optional[str]],
         pbar: Optional[tqdm] = None,
     ) -> AsyncIterator[Result]:
         """
@@ -160,12 +184,18 @@ def extract_problem(row: Dict[str, Any]) -> str:
     return str(prompt) if prompt else ""
 
 
-def extract_solution(row: Dict[str, Any]) -> str:
+def extract_solution(row: Dict[str, Any]) -> Optional[str]:
     rm = row.get("reward_model")
     if isinstance(rm, dict):
-        gt = rm.get("ground_truth", "")
+        gt = rm.get("ground_truth")
+        if not gt:
+            return None
         return gt if isinstance(gt, str) else json.dumps(gt)
-    return str(rm) if rm else ""
+    # Check for direct solution field
+    sol = row.get("solution") or row.get("answer") or row.get("ground_truth")
+    if sol:
+        return sol if isinstance(sol, str) else json.dumps(sol)
+    return None
 
 
 async def enrich_parquet(
@@ -187,6 +217,8 @@ async def enrich_parquet(
     rows = [df.iloc[i].to_dict() for i in range(n)]
     problems = [extract_problem(r) for r in rows]
     solutions = [extract_solution(r) for r in rows]
+    with_solution = sum(1 for s in solutions if s)
+    print(f"  {with_solution} with solution, {n - with_solution} without")
 
     # Track results by index
     results: Dict[int, Result] = {}
@@ -195,7 +227,6 @@ async def enrich_parquet(
     last_saved = 0
 
     def save_chunk(start: int, end: int):
-        """Save a chunk of results to JSONL."""
         nonlocal chunk_idx
         chunk_path = output_dir / f"chunk_{chunk_idx:04d}.jsonl"
         with open(chunk_path, "w") as f:
@@ -207,6 +238,7 @@ async def enrich_parquet(
                 row["estimated_difficulty"] = r.hints.estimated_difficulty if r.success else None
                 row["hints"] = r.hints.hints if r.success else None
                 row["hint_generation_success"] = r.success
+                row["had_reference_solution"] = solutions[i] is not None
                 if not r.success:
                     row["hint_generation_error"] = r.error
                 f.write(json.dumps(row, default=str) + "\n")
@@ -240,7 +272,7 @@ async def enrich_parquet(
         save_chunk(chunk_start, last_saved)
 
     # Also save complete parquet
-    all_diff, all_hints, all_ok, all_err = [], [], [], []
+    all_diff, all_hints, all_ok, all_err, all_has_sol = [], [], [], [], []
     for i in range(n):
         r = results.get(i)
         if r and r.success:
@@ -253,11 +285,13 @@ async def enrich_parquet(
             all_hints.append(None)
             all_ok.append(False)
             all_err.append(r.error if r else "missing")
+        all_has_sol.append(solutions[i] is not None)
 
     df["estimated_difficulty"] = all_diff
     df["hints"] = all_hints
     df["hint_generation_success"] = all_ok
     df["hint_generation_error"] = all_err
+    df["had_reference_solution"] = all_has_sol
 
     final_path = output_dir / "enriched.parquet"
     df.to_parquet(final_path, index=False)
