@@ -758,11 +758,165 @@ def create_hint_generator(
 
 
 # =============================================================================
+# Parquet Dataset Processing
+# =============================================================================
+
+def extract_problem_from_row(row: Dict[str, Any]) -> str:
+    """
+    Extract problem text from a parquet row.
+
+    Handles the Dolci-Think-RL schema:
+    - prompt: [{"role": "user", "content": "..."}]
+    """
+    prompt = row.get("prompt")
+    if prompt is None:
+        return ""
+
+    # Handle list of message dicts
+    if isinstance(prompt, list) and len(prompt) > 0:
+        first_msg = prompt[0]
+        if isinstance(first_msg, dict):
+            return first_msg.get("content", "")
+
+    # Fallback: treat as string
+    if isinstance(prompt, str):
+        return prompt
+
+    return str(prompt)
+
+
+def extract_solution_from_row(row: Dict[str, Any]) -> str:
+    """
+    Extract solution/ground_truth from a parquet row.
+
+    Handles the Dolci-Think-RL schema:
+    - reward_model: {"style": "...", "ground_truth": "JSON string"}
+    """
+    reward_model = row.get("reward_model")
+    if reward_model is None:
+        return ""
+
+    # Handle dict with ground_truth field
+    if isinstance(reward_model, dict):
+        ground_truth = reward_model.get("ground_truth", "")
+        # ground_truth is already a JSON string, return as-is for the LLM
+        if isinstance(ground_truth, str):
+            return ground_truth
+        return json.dumps(ground_truth)
+
+    return str(reward_model)
+
+
+def enrich_parquet(
+    input_path: str,
+    output_path: str,
+    generator: HintGenerator,
+    temperature: float = 0.7,
+    batch_size: int = 1000,
+    show_progress: bool = True,
+) -> Dict[str, Any]:
+    """
+    Enrich a parquet file with difficulty estimates and progressive hints.
+
+    Args:
+        input_path: Path to input parquet file
+        output_path: Path to output parquet file
+        generator: HintGenerator instance
+        temperature: Sampling temperature
+        batch_size: Process in batches of this size
+        show_progress: Show progress bars
+
+    Returns:
+        Statistics dict with success/failure counts
+    """
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    print(f"Loading {input_path}...")
+    df = pd.read_parquet(input_path)
+    total_rows = len(df)
+    print(f"Loaded {total_rows} rows")
+
+    # Extract problems and solutions
+    print("Extracting problems and solutions...")
+    problems = []
+    solutions = []
+
+    for idx in tqdm(range(total_rows), desc="Parsing rows", disable=not show_progress):
+        row = df.iloc[idx].to_dict()
+        problems.append(extract_problem_from_row(row))
+        solutions.append(extract_solution_from_row(row))
+
+    # Process in batches to manage memory and allow checkpointing
+    all_difficulties = []
+    all_hints = []
+    all_successes = []
+    all_errors = []
+
+    total_success = 0
+    num_batches = (total_rows + batch_size - 1) // batch_size
+
+    print(f"Processing {total_rows} rows in {num_batches} batches...")
+
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, total_rows)
+
+        batch_problems = problems[start_idx:end_idx]
+        batch_solutions = solutions[start_idx:end_idx]
+
+        results = generator.generate_batch(
+            problems=batch_problems,
+            solutions=batch_solutions,
+            temperature=temperature,
+            show_progress=show_progress,
+            desc=f"[Batch {batch_idx + 1}/{num_batches}]",
+        )
+
+        for result in results:
+            if result.success:
+                all_difficulties.append(result.hints.estimated_difficulty)
+                all_hints.append(json.dumps(result.hints.hints))
+                all_successes.append(True)
+                all_errors.append(None)
+                total_success += 1
+            else:
+                all_difficulties.append(None)
+                all_hints.append(None)
+                all_successes.append(False)
+                all_errors.append(result.error)
+
+    # Add new columns to dataframe
+    print("Adding enriched columns...")
+    df["estimated_difficulty"] = all_difficulties
+    df["hints"] = all_hints  # JSON string of list
+    df["hint_generation_success"] = all_successes
+    df["hint_generation_error"] = all_errors
+
+    # Save to parquet
+    print(f"Writing {output_path}...")
+    df.to_parquet(output_path, index=False)
+
+    stats = {
+        "total_rows": total_rows,
+        "successful": total_success,
+        "failed": total_rows - total_success,
+        "success_rate": total_success / max(1, total_rows),
+        **generator.get_statistics(),
+    }
+
+    print(f"Done! {total_success}/{total_rows} successful generations ({stats['success_rate']:.1%})")
+
+    return stats
+
+
+# =============================================================================
 # CLI Entrypoint
 # =============================================================================
 
 def main():
-    """CLI entrypoint for processing JSONL files."""
+    """CLI entrypoint for processing parquet/JSONL files."""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -770,11 +924,11 @@ def main():
     )
     parser.add_argument(
         "input_file",
-        help="Input JSONL file with 'problem' and 'solution' fields"
+        help="Input parquet or JSONL file"
     )
     parser.add_argument(
         "output_file",
-        help="Output JSONL file with added 'estimated_difficulty' and 'hints' fields"
+        help="Output parquet or JSONL file (same format as input)"
     )
     parser.add_argument(
         "--base-url",
@@ -810,32 +964,29 @@ def main():
         help="Batch timeout in seconds"
     )
     parser.add_argument(
-        "--problem-field",
-        default="problem",
-        help="Field name for problem in input JSON"
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Process parquet in batches of this size"
     )
     parser.add_argument(
-        "--solution-field",
-        default="solution",
-        help="Field name for solution in input JSON"
+        "--format",
+        choices=["auto", "parquet", "jsonl"],
+        default="auto",
+        help="Input/output format (auto-detected from extension by default)"
     )
 
     args = parser.parse_args()
 
-    # Load input data
-    print(f"Loading {args.input_file}...")
-    data = []
-    with open(args.input_file, "r") as f:
-        for line in f:
-            if line.strip():
-                data.append(json.loads(line))
+    # Detect format
+    fmt = args.format
+    if fmt == "auto":
+        if args.input_file.endswith(".parquet"):
+            fmt = "parquet"
+        else:
+            fmt = "jsonl"
 
-    print(f"Loaded {len(data)} examples")
-
-    problems = [d[args.problem_field] for d in data]
-    solutions = [d[args.solution_field] for d in data]
-
-    # Generate hints
+    # Create generator
     generator = create_hint_generator(
         base_url=args.base_url,
         api_key=args.api_key,
@@ -844,30 +995,59 @@ def main():
         batch_timeout=args.batch_timeout,
     )
 
-    enriched = generator.enrich_dataset(
-        problems=problems,
-        solutions=solutions,
-        temperature=args.temperature,
-    )
+    if fmt == "parquet":
+        # Process parquet file
+        stats = enrich_parquet(
+            input_path=args.input_file,
+            output_path=args.output_file,
+            generator=generator,
+            temperature=args.temperature,
+            batch_size=args.batch_size,
+        )
+        print(f"Statistics: {stats}")
 
-    # Merge with original data and write output
-    print(f"Writing {args.output_file}...")
-    success_count = 0
-    with open(args.output_file, "w") as f:
-        for orig, enriched_entry in zip(data, enriched):
-            # Merge original fields with enriched fields
-            output = {**orig}
-            output["estimated_difficulty"] = enriched_entry.get("estimated_difficulty")
-            output["hints"] = enriched_entry.get("hints")
-            output["hint_generation_success"] = enriched_entry["success"]
-            if not enriched_entry["success"]:
-                output["hint_generation_error"] = enriched_entry.get("error")
-            else:
-                success_count += 1
-            f.write(json.dumps(output) + "\n")
+    else:
+        # Process JSONL file (legacy support)
+        print(f"Loading {args.input_file}...")
+        data = []
+        with open(args.input_file, "r") as f:
+            for line in f:
+                if line.strip():
+                    data.append(json.loads(line))
 
-    print(f"Done! {success_count}/{len(data)} successful generations")
-    print(f"Statistics: {generator.get_statistics()}")
+        print(f"Loaded {len(data)} examples")
+
+        # Extract using same logic as parquet
+        problems = [extract_problem_from_row(d) for d in data]
+        solutions = [extract_solution_from_row(d) for d in data]
+
+        results = generator.generate_batch(
+            problems=problems,
+            solutions=solutions,
+            temperature=args.temperature,
+            desc="[HintGenerator] Processing JSONL",
+        )
+
+        # Merge with original data and write output
+        print(f"Writing {args.output_file}...")
+        success_count = 0
+        with open(args.output_file, "w") as f:
+            for orig, result in zip(data, results):
+                output = {**orig}
+                if result.success:
+                    output["estimated_difficulty"] = result.hints.estimated_difficulty
+                    output["hints"] = result.hints.hints
+                    output["hint_generation_success"] = True
+                    success_count += 1
+                else:
+                    output["estimated_difficulty"] = None
+                    output["hints"] = None
+                    output["hint_generation_success"] = False
+                    output["hint_generation_error"] = result.error
+                f.write(json.dumps(output) + "\n")
+
+        print(f"Done! {success_count}/{len(data)} successful generations")
+        print(f"Statistics: {generator.get_statistics()}")
 
 
 if __name__ == "__main__":
