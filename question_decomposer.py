@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, AsyncIterator
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from openai import AsyncOpenAI
 from tqdm import tqdm
 
@@ -29,28 +29,114 @@ if "KUBERNETES_SERVICE_HOST" in os.environ:
 
 
 # =============================================================================
-# Schemas
+# Taxonomy (defined first so schemas can validate against it)
+# =============================================================================
+
+SKILL_TAXONOMY = {
+    "foundations": [
+        "arithmetic", "fractions", "percentages", "ratios",
+        "basic_algebra", "linear_equations", "inequalities",
+        "basic_geometry", "coordinate_geometry", "trigonometry",
+        "set_theory", "logic", "boolean_algebra",
+    ],
+    "discrete_math": [
+        "combinatorics", "permutations", "combinations", "pigeonhole",
+        "graph_theory", "trees", "graph_traversal", "shortest_path",
+        "number_theory", "divisibility", "primes", "modular_arithmetic", "gcd_lcm",
+        "recurrences", "generating_functions",
+    ],
+    "algorithms": [
+        "sorting", "searching", "binary_search",
+        "dynamic_programming", "memoization", "greedy",
+        "divide_and_conquer", "backtracking", "branch_and_bound",
+        "string_matching", "hashing",
+    ],
+    "optimization": [
+        "linear_programming", "convex_optimization",
+        "gradient_descent", "constraint_satisfaction",
+        "game_theory", "minimax", "nash_equilibrium",
+    ],
+    "probability_stats": [
+        "counting", "probability_basics", "conditional_probability", "bayes",
+        "expected_value", "variance", "distributions",
+        "markov_chains", "random_walks",
+    ],
+    "reasoning": [
+        "case_analysis", "proof_by_contradiction", "induction",
+        "pattern_recognition", "abstraction", "decomposition",
+        "spatial_reasoning", "temporal_reasoning",
+    ],
+}
+
+CONTEXT_TAXONOMY = [
+    "finance", "physics", "biology", "chemistry", "computer_science",
+    "game_theory", "logistics", "social_networks", "sports", "economics",
+]
+
+VALID_SKILLS = {s for skills in SKILL_TAXONOMY.values() for s in skills}
+VALID_CONTEXTS = set(CONTEXT_TAXONOMY)
+
+DIFFICULTY_CALIBRATION = """
+L1-2: Single concept, direct application, 1-2 steps
+L3-4: Two concepts combined, some reasoning, 3-4 steps
+L5-6: Multiple concepts, non-obvious approach, 5-7 steps
+L7-8: Complex integration, insight required, 8-12 steps
+L9-10: Competition level, multiple insights, creative leaps
+"""
+
+def flatten_skills() -> str:
+    """Flatten taxonomy to bullet list for prompts."""
+    lines = []
+    for category, skills in SKILL_TAXONOMY.items():
+        lines.append(f"  {category}: {', '.join(skills)}")
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Schemas (with taxonomy validation)
 # =============================================================================
 
 class Skill(BaseModel):
-    name: str = Field(description="Skill name, e.g., 'modular_arithmetic', 'dynamic_programming'")
-    level: int = Field(ge=1, le=10, description="Mastery level required (1=basic, 10=expert)")
-    prerequisites: List[str] = Field(default_factory=list, description="Skill names that must be unlocked first")
+    name: str = Field(description="Skill from taxonomy")
+    level: int = Field(ge=1, le=10)
+    prerequisites: List[str] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def validate_skill(cls, v: str) -> str:
+        if v not in VALID_SKILLS:
+            # Find closest match for better error
+            raise ValueError(f"'{v}' not in taxonomy. Valid: {sorted(VALID_SKILLS)}")
+        return v
 
 
 class SubQuestion(BaseModel):
     """Depth: easier version targeting one skill."""
     question: str
     difficulty: int = Field(ge=1, le=10)
-    target_skill: str = Field(description="Which skill this sub-question trains")
+    target_skill: str
     answer: Optional[str] = None
+
+    @field_validator("target_skill")
+    @classmethod
+    def validate_target(cls, v: str) -> str:
+        if v not in VALID_SKILLS:
+            raise ValueError(f"'{v}' not in skill taxonomy")
+        return v
 
 
 class ContextVariation(BaseModel):
     """Breadth: same core problem in different context."""
-    context: str = Field(description="Domain/context, e.g., 'finance', 'physics', 'game_theory'")
-    question: str = Field(description="Problem rephrased in this context")
-    mapping: str = Field(description="How original concepts map to this context")
+    context: str
+    question: str
+    mapping: str
+
+    @field_validator("context")
+    @classmethod
+    def validate_context(cls, v: str) -> str:
+        if v not in VALID_CONTEXTS:
+            raise ValueError(f"'{v}' not in context taxonomy. Valid: {VALID_CONTEXTS}")
+        return v
 
 
 class QuestionDecomposition(BaseModel):
@@ -91,7 +177,7 @@ class DebateVerification(BaseModel):
 # Prompts
 # =============================================================================
 
-DECOMPOSE_SYSTEM = '''You are an expert at creating learning curricula from hard problems.
+DECOMPOSE_SYSTEM = f'''You are an expert at creating learning curricula from hard problems.
 
 Given a problem with its difficulty and progressive hints, create a skill-tree curriculum:
 1. Identify required skills (with prerequisites forming a DAG)
@@ -101,19 +187,28 @@ Given a problem with its difficulty and progressive hints, create a skill-tree c
    - Use the hints to inform what skills/concepts are needed
 3. Count minimum reasoning steps
 
-Skill naming: snake_case like "modular_arithmetic", "graph_traversal", "dynamic_programming"
-Sub-questions must be SELF-CONTAINED.
+## Skill Taxonomy (use ONLY these skill names):
+{flatten_skills()}
 
-JSON only.'''
+## Difficulty Calibration:
+{DIFFICULTY_CALIBRATION}
 
-DECOMPOSE_SYSTEM_NO_HINTS = '''You are an expert at creating learning curricula from hard problems.
+Sub-questions must be SELF-CONTAINED. JSON only.'''
+
+DECOMPOSE_SYSTEM_NO_HINTS = f'''You are an expert at creating learning curricula from hard problems.
 
 Given a problem, create a skill-tree curriculum:
 1. Estimate difficulty (1-10) and identify required skills (with prerequisites)
 2. Generate 3-6 sub-questions building up to the original
 3. Count minimum reasoning steps
 
-Skill naming: snake_case. Sub-questions must be SELF-CONTAINED. JSON only.'''
+## Skill Taxonomy (use ONLY these skill names):
+{flatten_skills()}
+
+## Difficulty Calibration:
+{DIFFICULTY_CALIBRATION}
+
+Sub-questions must be SELF-CONTAINED. JSON only.'''
 
 ANSWER_SYSTEM = '''Solve step by step. Be precise.
 JSON: {answer: <final>, confidence: 0-1, reasoning: <steps>}'''
@@ -121,18 +216,13 @@ JSON: {answer: <final>, confidence: 0-1, reasoning: <steps>}'''
 DEBATE_SYSTEM = '''Verify this answer. Be rigorous.
 JSON: {is_correct: bool, critique: <explanation>, final_answer: <corrected or null>}'''
 
-BREADTH_SYSTEM = '''You are an expert at recognizing abstract problem structures.
+BREADTH_SYSTEM = f'''You are an expert at recognizing abstract problem structures.
 
 Given a problem, extract its core concept and generate variations in different contexts.
 The variations must test the SAME underlying skill but in different domains.
 
-Examples of context domains:
-- finance (stocks, portfolios, interest)
-- physics (motion, energy, waves)
-- biology (populations, genetics, ecosystems)
-- game_theory (strategies, payoffs, equilibria)
-- logistics (routing, scheduling, inventory)
-- social_networks (connections, influence, spread)
+## Context Taxonomy (use ONLY these contexts):
+{', '.join(CONTEXT_TAXONOMY)}
 
 Each variation must be:
 1. Solvable using the exact same algorithm/approach
