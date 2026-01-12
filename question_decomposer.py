@@ -39,20 +39,38 @@ class Skill(BaseModel):
 
 
 class SubQuestion(BaseModel):
+    """Depth: easier version targeting one skill."""
     question: str
     difficulty: int = Field(ge=1, le=10)
     target_skill: str = Field(description="Which skill this sub-question trains")
     answer: Optional[str] = None
 
 
+class ContextVariation(BaseModel):
+    """Breadth: same core problem in different context."""
+    context: str = Field(description="Domain/context, e.g., 'finance', 'physics', 'game_theory'")
+    question: str = Field(description="Problem rephrased in this context")
+    mapping: str = Field(description="How original concepts map to this context")
+
+
 class QuestionDecomposition(BaseModel):
-    """Output of Pass 1: Decompose hard question into skill tree + curriculum."""
+    """Depth decomposition: skill tree + curriculum."""
     required_skills: List[Skill] = Field(description="Skills needed, with prerequisites")
     sub_questions: List[SubQuestion] = Field(
         min_length=3, max_length=6,
         description="Curriculum from easiest to hardest, building up to original"
     )
     reasoning_steps: int = Field(ge=1, description="Min reasoning steps to solve original")
+
+
+class BreadthExpansion(BaseModel):
+    """Breadth expansion: same problem structure in different contexts."""
+    core_concept: str = Field(description="The fundamental concept being tested")
+    abstract_structure: str = Field(description="Abstract problem structure without domain specifics")
+    variations: List[ContextVariation] = Field(
+        min_length=3, max_length=5,
+        description="Same problem in different real-world contexts"
+    )
 
 
 class VerifiedAnswer(BaseModel):
@@ -102,6 +120,26 @@ JSON: {answer: <final>, confidence: 0-1, reasoning: <steps>}'''
 
 DEBATE_SYSTEM = '''Verify this answer. Be rigorous.
 JSON: {is_correct: bool, critique: <explanation>, final_answer: <corrected or null>}'''
+
+BREADTH_SYSTEM = '''You are an expert at recognizing abstract problem structures.
+
+Given a problem, extract its core concept and generate variations in different contexts.
+The variations must test the SAME underlying skill but in different domains.
+
+Examples of context domains:
+- finance (stocks, portfolios, interest)
+- physics (motion, energy, waves)
+- biology (populations, genetics, ecosystems)
+- game_theory (strategies, payoffs, equilibria)
+- logistics (routing, scheduling, inventory)
+- social_networks (connections, influence, spread)
+
+Each variation must be:
+1. Solvable using the exact same algorithm/approach
+2. Self-contained (no reference to original)
+3. Realistic in its domain
+
+JSON only.'''
 
 
 # =============================================================================
@@ -192,6 +230,15 @@ class QuestionDecomposer:
         return await self._call(DEBATE_SYSTEM, user, DebateVerification)
 
     # -------------------------------------------------------------------------
+    # Breadth: Generate contextual variations
+    # -------------------------------------------------------------------------
+    async def expand_breadth(self, question: str, solution: Optional[str] = None) -> Optional[BreadthExpansion]:
+        context = f"## Problem\n{question}"
+        if solution:
+            context += f"\n\n## Solution Approach\n{solution}"
+        return await self._call(BREADTH_SYSTEM, context, BreadthExpansion)
+
+    # -------------------------------------------------------------------------
     # Full pipeline for one question
     # -------------------------------------------------------------------------
     async def process_one(
@@ -201,6 +248,7 @@ class QuestionDecomposer:
         idx: int,
         difficulty: Optional[int] = None,
         hints: Optional[List[str]] = None,
+        include_breadth: bool = True,
     ) -> Dict[str, Any]:
         result = {
             "index": idx,
@@ -254,6 +302,17 @@ class QuestionDecomposer:
             verified_subs.append(sub_result)
 
         result["sub_questions"] = verified_subs
+
+        # Breadth expansion: same problem in different contexts
+        if include_breadth:
+            breadth = await self.expand_breadth(question, solution)
+            if breadth:
+                result["breadth"] = {
+                    "core_concept": breadth.core_concept,
+                    "abstract_structure": breadth.abstract_structure,
+                    "variations": [v.model_dump() for v in breadth.variations],
+                }
+
         result["success"] = True
         return result
 
@@ -267,6 +326,7 @@ class QuestionDecomposer:
         difficulties: List[Optional[int]],
         hints_list: List[Optional[List[str]]],
         pbar: Optional[tqdm] = None,
+        include_breadth: bool = True,
     ) -> AsyncIterator[Dict[str, Any]]:
         await self._init_model()
         n = len(questions)
@@ -277,7 +337,7 @@ class QuestionDecomposer:
             task = asyncio.create_task(
                 self.process_one(
                     questions[idx], solutions[idx], idx,
-                    difficulties[idx], hints_list[idx]
+                    difficulties[idx], hints_list[idx], include_breadth
                 )
             )
             pending[task] = idx
@@ -335,6 +395,132 @@ def aggregate_skill_tree(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 # =============================================================================
 # Visualization
 # =============================================================================
+
+def generate_mermaid(result: Dict[str, Any]) -> str:
+    """Generate Mermaid graph showing depth (curriculum) and breadth (variations)."""
+    if not result.get("success"):
+        return f"graph TD\n    ERR[Error: {result.get('error', 'unknown')}]"
+
+    lines = ["graph TD"]
+    diff = result.get("original_difficulty", "?")
+
+    # Original question node
+    q_short = result.get("original_question", "")[:40].replace('"', "'")
+    lines.append(f'    ORIG["{q_short}..."]')
+    lines.append(f'    style ORIG fill:#ff6b6b,stroke:#333,stroke-width:2px')
+
+    # Skills subgraph
+    skills = result.get("required_skills", [])
+    if skills:
+        lines.append("")
+        lines.append("    subgraph SKILLS[Required Skills]")
+        for i, skill in enumerate(skills):
+            name = skill["name"]
+            level = skill["level"]
+            node_id = f"S{i}"
+            lines.append(f'        {node_id}["{name} L{level}"]')
+            # Style by level
+            if level >= 8:
+                lines.append(f"        style {node_id} fill:#e74c3c")
+            elif level >= 5:
+                lines.append(f"        style {node_id} fill:#f39c12")
+            else:
+                lines.append(f"        style {node_id} fill:#2ecc71")
+        lines.append("    end")
+
+        # Skill prerequisites
+        for i, skill in enumerate(skills):
+            prereqs = skill.get("prerequisites", [])
+            for prereq in prereqs:
+                for j, other in enumerate(skills):
+                    if other["name"] == prereq:
+                        lines.append(f"    S{j} --> S{i}")
+
+    # Depth: sub-questions curriculum
+    subs = result.get("sub_questions", [])
+    if subs:
+        lines.append("")
+        lines.append("    subgraph DEPTH[Curriculum - Depth]")
+        lines.append("        direction TB")
+        for i, sq in enumerate(subs):
+            q_text = sq.get("question", "")[:35].replace('"', "'")
+            d = sq.get("difficulty", "?")
+            skill = sq.get("target_skill", "?")[:15]
+            verified = "✓" if sq.get("verified") else "✗"
+            node_id = f"Q{i}"
+            lines.append(f'        {node_id}["{verified} L{d}: {q_text}..."]')
+            # Color by verification status
+            if sq.get("verified"):
+                lines.append(f"        style {node_id} fill:#a8e6cf")
+            else:
+                lines.append(f"        style {node_id} fill:#ffd3b6")
+        lines.append("    end")
+
+        # Chain sub-questions
+        for i in range(len(subs) - 1):
+            lines.append(f"    Q{i} --> Q{i+1}")
+        if subs:
+            lines.append(f"    Q{len(subs)-1} --> ORIG")
+
+    # Breadth: contextual variations
+    breadth = result.get("breadth", {})
+    variations = breadth.get("variations", [])
+    if variations:
+        lines.append("")
+        core = breadth.get("core_concept", "")[:30].replace('"', "'")
+        lines.append(f"    subgraph BREADTH[Breadth - Same Concept Different Context]")
+        lines.append("        direction LR")
+        lines.append(f'        CORE(("{core}"))')
+        lines.append("        style CORE fill:#dda0dd")
+        for i, var in enumerate(variations):
+            ctx = var.get("context", "")[:15]
+            q_text = var.get("question", "")[:30].replace('"', "'")
+            node_id = f"V{i}"
+            lines.append(f'        {node_id}["{ctx}: {q_text}..."]')
+            lines.append(f"        style {node_id} fill:#87ceeb")
+        lines.append("    end")
+        # Connect core to variations
+        for i in range(len(variations)):
+            lines.append(f"    CORE --> V{i}")
+        lines.append("    ORIG -.-> CORE")
+
+    return "\n".join(lines)
+
+
+def generate_mermaid_skill_tree(tree: Dict[str, Any], top_n: int = 20) -> str:
+    """Generate Mermaid graph of global skill tree."""
+    lines = ["graph LR"]
+    skills = tree.get("skills", {})
+
+    if not skills:
+        return "graph TD\n    EMPTY[No skills found]"
+
+    max_count = max(s["count"] for s in skills.values())
+
+    for i, (name, data) in enumerate(list(skills.items())[:top_n]):
+        count = data["count"]
+        avg_lvl = data["avg_level"]
+        node_id = f"SK{i}"
+        lines.append(f'    {node_id}["{name}<br/>n={count}, L={avg_lvl:.1f}"]')
+
+        # Color by average level
+        if avg_lvl >= 7:
+            lines.append(f"    style {node_id} fill:#e74c3c")
+        elif avg_lvl >= 4:
+            lines.append(f"    style {node_id} fill:#f39c12")
+        else:
+            lines.append(f"    style {node_id} fill:#2ecc71")
+
+    # Draw prerequisite edges
+    skill_names = list(skills.keys())[:top_n]
+    for i, (name, data) in enumerate(list(skills.items())[:top_n]):
+        for prereq in data.get("prerequisites", []):
+            if prereq in skill_names:
+                j = skill_names.index(prereq)
+                lines.append(f"    SK{j} --> SK{i}")
+
+    return "\n".join(lines)
+
 
 def visualize_decomposition(result: Dict[str, Any], max_width: int = 80) -> str:
     """Generate ASCII visualization of a decomposed question."""
@@ -395,8 +581,28 @@ def visualize_decomposition(result: Dict[str, Any], max_width: int = 80) -> str:
             lines.append("   ▼")
 
     lines.append("   └" + "─" * 60)
-    lines.append("")
 
+    # Breadth variations
+    breadth = result.get("breadth", {})
+    variations = breadth.get("variations", [])
+    if variations:
+        core = breadth.get("core_concept", "?")
+        abstract = breadth.get("abstract_structure", "")[:60]
+        lines.append(f"\n🔀 BREADTH VARIATIONS (core: {core})")
+        lines.append(f"   Abstract: {abstract}{'...' if len(breadth.get('abstract_structure', '')) > 60 else ''}")
+        lines.append("   ┌" + "─" * 60)
+        for i, var in enumerate(variations):
+            ctx = var.get("context", "?")
+            q_text = var.get("question", "")[:50]
+            mapping = var.get("mapping", "")[:40]
+            lines.append(f"   │ [{ctx}]")
+            lines.append(f"   │    {q_text}{'...' if len(var.get('question', '')) > 50 else ''}")
+            lines.append(f"   │    ↔ {mapping}")
+            if i < len(variations) - 1:
+                lines.append("   │")
+        lines.append("   └" + "─" * 60)
+
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -487,6 +693,7 @@ async def process_parquet(
     decomposer: QuestionDecomposer,
     chunk_size: int = 500,
     filter_difficulty: Optional[int] = None,
+    include_breadth: bool = True,
 ):
     import pandas as pd
 
@@ -536,7 +743,7 @@ async def process_parquet(
 
     pbar = tqdm(total=n, desc="Decomposing questions", unit="q")
 
-    async for result in decomposer.process_continuous(questions, solutions, difficulties, hints_list, pbar):
+    async for result in decomposer.process_continuous(questions, solutions, difficulties, hints_list, pbar, include_breadth):
         results[result["index"]] = result
 
         while last_saved in results:
@@ -559,14 +766,32 @@ async def process_parquet(
     print(f"\nSkill tree: {tree_path}")
     print(visualize_skill_tree(skill_tree))
 
-    # Save a sample visualization
+    # Save sample visualizations (ASCII + Mermaid)
     success_results = [r for r in all_results if r.get("success")]
     if success_results:
+        # ASCII
         sample_path = output_dir / "sample_visualization.txt"
         with open(sample_path, "w") as f:
             for r in success_results[:3]:
                 f.write(visualize_decomposition(r) + "\n\n")
         print(f"\nSample visualizations: {sample_path}")
+
+        # Mermaid graphs
+        mermaid_path = output_dir / "sample_graphs.md"
+        with open(mermaid_path, "w") as f:
+            f.write("# Question Decomposition Graphs\n\n")
+            for i, r in enumerate(success_results[:3]):
+                f.write(f"## Sample {i+1}\n\n")
+                q_short = r.get("original_question", "")[:100]
+                f.write(f"> {q_short}...\n\n")
+                f.write("```mermaid\n")
+                f.write(generate_mermaid(r))
+                f.write("\n```\n\n")
+            # Global skill tree
+            f.write("## Global Skill Tree\n\n```mermaid\n")
+            f.write(generate_mermaid_skill_tree(skill_tree))
+            f.write("\n```\n")
+        print(f"Mermaid graphs: {mermaid_path}")
 
     success = len(success_results)
     print(f"\nDone: {success}/{n} successfully decomposed")
@@ -584,7 +809,9 @@ def main():
     p.add_argument("--chunk-size", type=int, default=500)
     p.add_argument("--timeout", type=float, default=180.0)
     p.add_argument("--min-difficulty", type=int, default=None, help="Only process questions >= this difficulty")
+    p.add_argument("--no-breadth", action="store_true", help="Skip breadth expansion (faster)")
     p.add_argument("--visualize", type=int, default=None, metavar="N", help="Just visualize N samples from decomposed JSONL, don't process")
+    p.add_argument("--graph", action="store_true", help="Output Mermaid graph format instead of ASCII (with --visualize)")
     args = p.parse_args()
 
     # Visualize mode: just show samples from already-decomposed data
@@ -601,8 +828,13 @@ def main():
         print(f"Loaded {len(data)} results, {len(success)} successful\n")
 
         for r in success[:args.visualize]:
-            print(visualize_decomposition(r))
-            print()
+            if args.graph:
+                print("```mermaid")
+                print(generate_mermaid(r))
+                print("```\n")
+            else:
+                print(visualize_decomposition(r))
+                print()
         return
 
     # Full processing mode
@@ -620,6 +852,7 @@ def main():
         decomposer,
         args.chunk_size,
         args.min_difficulty,
+        include_breadth=not args.no_breadth,
     ))
 
 
