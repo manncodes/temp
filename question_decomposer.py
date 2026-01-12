@@ -396,128 +396,100 @@ def aggregate_skill_tree(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Visualization
 # =============================================================================
 
-def generate_mermaid(result: Dict[str, Any]) -> str:
-    """Generate Mermaid graph showing depth (curriculum) and breadth (variations)."""
+def render_tree(result: Dict[str, Any]) -> str:
+    """Render decomposition as ASCII tree showing skills, depth curriculum, and breadth."""
     if not result.get("success"):
-        return f"graph TD\n    ERR[Error: {result.get('error', 'unknown')}]"
+        return f"[ERROR] {result.get('error', 'unknown')}"
 
-    lines = ["graph TD"]
+    lines = []
+    q_short = result.get("original_question", "")[:60]
     diff = result.get("original_difficulty", "?")
+    steps = result.get("reasoning_steps", "?")
 
-    # Original question node
-    q_short = result.get("original_question", "")[:40].replace('"', "'")
-    lines.append(f'    ORIG["{q_short}..."]')
-    lines.append(f'    style ORIG fill:#ff6b6b,stroke:#333,stroke-width:2px')
+    lines.append(f"[L{diff}] {q_short}...")
+    lines.append(f"│   (steps={steps})")
 
-    # Skills subgraph
     skills = result.get("required_skills", [])
-    if skills:
-        lines.append("")
-        lines.append("    subgraph SKILLS[Required Skills]")
-        for i, skill in enumerate(skills):
-            name = skill["name"]
-            level = skill["level"]
-            node_id = f"S{i}"
-            lines.append(f'        {node_id}["{name} L{level}"]')
-            # Style by level
-            if level >= 8:
-                lines.append(f"        style {node_id} fill:#e74c3c")
-            elif level >= 5:
-                lines.append(f"        style {node_id} fill:#f39c12")
-            else:
-                lines.append(f"        style {node_id} fill:#2ecc71")
-        lines.append("    end")
-
-        # Skill prerequisites
-        for i, skill in enumerate(skills):
-            prereqs = skill.get("prerequisites", [])
-            for prereq in prereqs:
-                for j, other in enumerate(skills):
-                    if other["name"] == prereq:
-                        lines.append(f"    S{j} --> S{i}")
-
-    # Depth: sub-questions curriculum
     subs = result.get("sub_questions", [])
-    if subs:
-        lines.append("")
-        lines.append("    subgraph DEPTH[Curriculum - Depth]")
-        lines.append("        direction TB")
-        for i, sq in enumerate(subs):
-            q_text = sq.get("question", "")[:35].replace('"', "'")
-            d = sq.get("difficulty", "?")
-            skill = sq.get("target_skill", "?")[:15]
-            verified = "✓" if sq.get("verified") else "✗"
-            node_id = f"Q{i}"
-            lines.append(f'        {node_id}["{verified} L{d}: {q_text}..."]')
-            # Color by verification status
-            if sq.get("verified"):
-                lines.append(f"        style {node_id} fill:#a8e6cf")
-            else:
-                lines.append(f"        style {node_id} fill:#ffd3b6")
-        lines.append("    end")
-
-        # Chain sub-questions
-        for i in range(len(subs) - 1):
-            lines.append(f"    Q{i} --> Q{i+1}")
-        if subs:
-            lines.append(f"    Q{len(subs)-1} --> ORIG")
-
-    # Breadth: contextual variations
     breadth = result.get("breadth", {})
     variations = breadth.get("variations", [])
+
+    has_subs = bool(subs)
+    has_breadth = bool(variations)
+
+    # Skills branch
+    if skills:
+        branch = "├" if (has_subs or has_breadth) else "└"
+        lines.append(f"{branch}── SKILLS")
+        for i, sk in enumerate(skills):
+            is_last = (i == len(skills) - 1)
+            prefix = "│   " if (has_subs or has_breadth) else "    "
+            conn = "└" if is_last else "├"
+            prereqs = sk.get("prerequisites", [])
+            prereq_str = f" ← {','.join(prereqs)}" if prereqs else ""
+            lines.append(f"{prefix}{conn}── [{sk['level']:2d}] {sk['name']}{prereq_str}")
+
+    # Depth branch
+    if subs:
+        branch = "├" if has_breadth else "└"
+        lines.append(f"{branch}── DEPTH")
+        prefix = "│   " if has_breadth else "    "
+        for i, sq in enumerate(subs):
+            is_last = (i == len(subs) - 1)
+            conn = "└" if is_last else "├"
+            verified = "✓" if sq.get("verified") else "✗"
+            d = sq.get("difficulty", "?")
+            skill = sq.get("target_skill", "")[:20]
+            q_text = sq.get("question", "")[:45]
+            lines.append(f"{prefix}{conn}── {verified} [L{d}] ({skill})")
+            sub_prefix = prefix + ("    " if is_last else "│   ")
+            lines.append(f"{sub_prefix}{q_text}...")
+
+    # Breadth branch
     if variations:
-        lines.append("")
-        core = breadth.get("core_concept", "")[:30].replace('"', "'")
-        lines.append(f"    subgraph BREADTH[Breadth - Same Concept Different Context]")
-        lines.append("        direction LR")
-        lines.append(f'        CORE(("{core}"))')
-        lines.append("        style CORE fill:#dda0dd")
+        core = breadth.get("core_concept", "?")
+        lines.append(f"└── BREADTH (core: {core})")
         for i, var in enumerate(variations):
-            ctx = var.get("context", "")[:15]
-            q_text = var.get("question", "")[:30].replace('"', "'")
-            node_id = f"V{i}"
-            lines.append(f'        {node_id}["{ctx}: {q_text}..."]')
-            lines.append(f"        style {node_id} fill:#87ceeb")
-        lines.append("    end")
-        # Connect core to variations
-        for i in range(len(variations)):
-            lines.append(f"    CORE --> V{i}")
-        lines.append("    ORIG -.-> CORE")
+            is_last = (i == len(variations) - 1)
+            conn = "└" if is_last else "├"
+            ctx = var.get("context", "?")
+            q_text = var.get("question", "")[:50]
+            lines.append(f"    {conn}── [{ctx}]")
+            sub_prefix = "        " if is_last else "    │   "
+            lines.append(f"{sub_prefix}{q_text}...")
 
     return "\n".join(lines)
 
 
-def generate_mermaid_skill_tree(tree: Dict[str, Any], top_n: int = 20) -> str:
-    """Generate Mermaid graph of global skill tree."""
-    lines = ["graph LR"]
+def render_skill_dag(tree: Dict[str, Any], top_n: int = 20) -> str:
+    """Render global skill tree as ASCII DAG."""
     skills = tree.get("skills", {})
-
     if not skills:
-        return "graph TD\n    EMPTY[No skills found]"
+        return "[No skills]"
 
-    max_count = max(s["count"] for s in skills.values())
+    lines = [f"SKILL DAG ({tree.get('total_questions', 0)} questions)", "=" * 50]
 
-    for i, (name, data) in enumerate(list(skills.items())[:top_n]):
-        count = data["count"]
-        avg_lvl = data["avg_level"]
-        node_id = f"SK{i}"
-        lines.append(f'    {node_id}["{name}<br/>n={count}, L={avg_lvl:.1f}"]')
-
-        # Color by average level
-        if avg_lvl >= 7:
-            lines.append(f"    style {node_id} fill:#e74c3c")
-        elif avg_lvl >= 4:
-            lines.append(f"    style {node_id} fill:#f39c12")
+    base_skills = []
+    derived_skills = []
+    for name, data in list(skills.items())[:top_n]:
+        if data.get("prerequisites"):
+            derived_skills.append((name, data))
         else:
-            lines.append(f"    style {node_id} fill:#2ecc71")
+            base_skills.append((name, data))
 
-    # Draw prerequisite edges
-    skill_names = list(skills.keys())[:top_n]
-    for i, (name, data) in enumerate(list(skills.items())[:top_n]):
-        for prereq in data.get("prerequisites", []):
-            if prereq in skill_names:
-                j = skill_names.index(prereq)
-                lines.append(f"    SK{j} --> SK{i}")
+    if base_skills:
+        lines.append("\nBASE SKILLS:")
+        for name, data in base_skills:
+            bar = "█" * min(int(data["count"] / 5) + 1, 20)
+            lines.append(f"  [{data['avg_level']:.0f}] {name:<25} n={data['count']:3d} {bar}")
+
+    if derived_skills:
+        lines.append("\nDERIVED SKILLS:")
+        for name, data in derived_skills:
+            prereqs = data.get("prerequisites", [])[:3]
+            bar = "█" * min(int(data["count"] / 5) + 1, 20)
+            lines.append(f"  [{data['avg_level']:.0f}] {name:<25} n={data['count']:3d} {bar}")
+            lines.append(f"       └─ requires: {' + '.join(prereqs)}")
 
     return "\n".join(lines)
 
@@ -766,32 +738,17 @@ async def process_parquet(
     print(f"\nSkill tree: {tree_path}")
     print(visualize_skill_tree(skill_tree))
 
-    # Save sample visualizations (ASCII + Mermaid)
+    # Save sample visualizations
     success_results = [r for r in all_results if r.get("success")]
     if success_results:
-        # ASCII
-        sample_path = output_dir / "sample_visualization.txt"
+        sample_path = output_dir / "sample_trees.txt"
         with open(sample_path, "w") as f:
-            for r in success_results[:3]:
-                f.write(visualize_decomposition(r) + "\n\n")
-        print(f"\nSample visualizations: {sample_path}")
-
-        # Mermaid graphs
-        mermaid_path = output_dir / "sample_graphs.md"
-        with open(mermaid_path, "w") as f:
-            f.write("# Question Decomposition Graphs\n\n")
-            for i, r in enumerate(success_results[:3]):
-                f.write(f"## Sample {i+1}\n\n")
-                q_short = r.get("original_question", "")[:100]
-                f.write(f"> {q_short}...\n\n")
-                f.write("```mermaid\n")
-                f.write(generate_mermaid(r))
-                f.write("\n```\n\n")
-            # Global skill tree
-            f.write("## Global Skill Tree\n\n```mermaid\n")
-            f.write(generate_mermaid_skill_tree(skill_tree))
-            f.write("\n```\n")
-        print(f"Mermaid graphs: {mermaid_path}")
+            for i, r in enumerate(success_results[:5]):
+                f.write(f"{'='*60}\nSAMPLE {i+1}\n{'='*60}\n")
+                f.write(render_tree(r) + "\n\n")
+            f.write(f"{'='*60}\n")
+            f.write(render_skill_dag(skill_tree))
+        print(f"\nSample trees: {sample_path}")
 
     success = len(success_results)
     print(f"\nDone: {success}/{n} successfully decomposed")
@@ -811,7 +768,7 @@ def main():
     p.add_argument("--min-difficulty", type=int, default=None, help="Only process questions >= this difficulty")
     p.add_argument("--no-breadth", action="store_true", help="Skip breadth expansion (faster)")
     p.add_argument("--visualize", type=int, default=None, metavar="N", help="Just visualize N samples from decomposed JSONL, don't process")
-    p.add_argument("--graph", action="store_true", help="Output Mermaid graph format instead of ASCII (with --visualize)")
+    p.add_argument("--tree", action="store_true", help="Use compact tree format (with --visualize)")
     args = p.parse_args()
 
     # Visualize mode: just show samples from already-decomposed data
@@ -828,13 +785,11 @@ def main():
         print(f"Loaded {len(data)} results, {len(success)} successful\n")
 
         for r in success[:args.visualize]:
-            if args.graph:
-                print("```mermaid")
-                print(generate_mermaid(r))
-                print("```\n")
+            if args.tree:
+                print(render_tree(r))
             else:
                 print(visualize_decomposition(r))
-                print()
+            print()
         return
 
     # Full processing mode
