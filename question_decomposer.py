@@ -1,904 +1,377 @@
 """
-Skill-Tree Question Decomposer for RL Curriculum Generation.
-
-Takes hard questions (zero/low pass rate) and decomposes them into:
-1. Required skills (skill tree nodes)
-2. Prerequisite sub-questions at lower difficulty
-3. Verified Q&A pairs via debate
-
-Reuses hints + difficulty from hint_generator.py if available.
-
-Usage: python question_decomposer.py input.parquet output_dir/ --base-url http://0.0.0.0:8000/v1
+Question decomposer for RL curriculum generation.
+Decomposes hard problems into skill trees, sub-questions, and contextual variations.
 """
-
-import asyncio
-import json
-import os
-from dataclasses import dataclass, field
+import asyncio, json, os
 from typing import List, Optional, Dict, Any, AsyncIterator
 from pathlib import Path
-
 from pydantic import BaseModel, Field, field_validator
 from openai import AsyncOpenAI
 from tqdm import tqdm
 
 if "KUBERNETES_SERVICE_HOST" in os.environ:
-    for var in ("NO_PROXY", "no_proxy"):
-        if os.getenv(var):
-            os.environ[var] += ",.svc.cluster.local"
+    for v in ("NO_PROXY", "no_proxy"):
+        if os.getenv(v): os.environ[v] += ",.svc.cluster.local"
 
-
-# =============================================================================
-# Taxonomy (defined first so schemas can validate against it)
-# =============================================================================
-
-SKILL_TAXONOMY = {
-    "foundations": [
-        "arithmetic", "fractions", "percentages", "ratios",
-        "basic_algebra", "linear_equations", "inequalities",
-        "basic_geometry", "coordinate_geometry", "trigonometry",
-        "set_theory", "logic", "boolean_algebra",
-    ],
-    "discrete_math": [
-        "combinatorics", "permutations", "combinations", "pigeonhole",
-        "graph_theory", "trees", "graph_traversal", "shortest_path",
-        "number_theory", "divisibility", "primes", "modular_arithmetic", "gcd_lcm",
-        "recurrences", "generating_functions",
-    ],
-    "algorithms": [
-        "sorting", "searching", "binary_search",
-        "dynamic_programming", "memoization", "greedy",
-        "divide_and_conquer", "backtracking", "branch_and_bound",
-        "string_matching", "hashing",
-    ],
-    "optimization": [
-        "linear_programming", "convex_optimization",
-        "gradient_descent", "constraint_satisfaction",
-        "game_theory", "minimax", "nash_equilibrium",
-    ],
-    "probability_stats": [
-        "counting", "probability_basics", "conditional_probability", "bayes",
-        "expected_value", "variance", "distributions",
-        "markov_chains", "random_walks",
-    ],
-    "reasoning": [
-        "case_analysis", "proof_by_contradiction", "induction",
-        "pattern_recognition", "abstraction", "decomposition",
-        "spatial_reasoning", "temporal_reasoning",
-    ],
+# --- Taxonomy ---
+SKILLS = {
+    "foundations": ["arithmetic", "fractions", "percentages", "ratios", "basic_algebra",
+                    "linear_equations", "inequalities", "basic_geometry", "coordinate_geometry",
+                    "trigonometry", "set_theory", "logic", "boolean_algebra"],
+    "discrete": ["combinatorics", "permutations", "combinations", "pigeonhole", "graph_theory",
+                 "trees", "graph_traversal", "shortest_path", "number_theory", "divisibility",
+                 "primes", "modular_arithmetic", "gcd_lcm", "recurrences", "generating_functions"],
+    "algorithms": ["sorting", "searching", "binary_search", "dynamic_programming", "memoization",
+                   "greedy", "divide_and_conquer", "backtracking", "branch_and_bound",
+                   "string_matching", "hashing"],
+    "optimization": ["linear_programming", "convex_optimization", "gradient_descent",
+                     "constraint_satisfaction", "game_theory", "minimax", "nash_equilibrium"],
+    "probability": ["counting", "probability_basics", "conditional_probability", "bayes",
+                    "expected_value", "variance", "distributions", "markov_chains", "random_walks"],
+    "reasoning": ["case_analysis", "proof_by_contradiction", "induction", "pattern_recognition",
+                  "abstraction", "decomposition", "spatial_reasoning", "temporal_reasoning"],
 }
+CONTEXTS = ["finance", "physics", "biology", "chemistry", "computer_science",
+            "game_theory", "logistics", "social_networks", "sports", "economics"]
+VALID_SKILLS = {s for cat in SKILLS.values() for s in cat}
+VALID_CONTEXTS = set(CONTEXTS)
 
-CONTEXT_TAXONOMY = [
-    "finance", "physics", "biology", "chemistry", "computer_science",
-    "game_theory", "logistics", "social_networks", "sports", "economics",
-]
+DIFFICULTY_GUIDE = """L1-2: Single concept, 1-2 steps | L3-4: Two concepts, 3-4 steps
+L5-6: Multiple concepts, 5-7 steps | L7-8: Complex, 8-12 steps | L9-10: Competition level"""
 
-VALID_SKILLS = {s for skills in SKILL_TAXONOMY.values() for s in skills}
-VALID_CONTEXTS = set(CONTEXT_TAXONOMY)
+def _skill_list() -> str:
+    return "\n".join(f"  {k}: {', '.join(v)}" for k, v in SKILLS.items())
 
-DIFFICULTY_CALIBRATION = """
-L1-2: Single concept, direct application, 1-2 steps
-L3-4: Two concepts combined, some reasoning, 3-4 steps
-L5-6: Multiple concepts, non-obvious approach, 5-7 steps
-L7-8: Complex integration, insight required, 8-12 steps
-L9-10: Competition level, multiple insights, creative leaps
-"""
-
-def flatten_skills() -> str:
-    """Flatten taxonomy to bullet list for prompts."""
-    lines = []
-    for category, skills in SKILL_TAXONOMY.items():
-        lines.append(f"  {category}: {', '.join(skills)}")
-    return "\n".join(lines)
-
-
-# =============================================================================
-# Schemas (with taxonomy validation)
-# =============================================================================
-
+# --- Schemas ---
 class Skill(BaseModel):
-    name: str = Field(description="Skill from taxonomy")
+    name: str
     level: int = Field(ge=1, le=10)
     prerequisites: List[str] = Field(default_factory=list)
-
     @field_validator("name")
     @classmethod
-    def validate_skill(cls, v: str) -> str:
-        if v not in VALID_SKILLS:
-            # Find closest match for better error
-            raise ValueError(f"'{v}' not in taxonomy. Valid: {sorted(VALID_SKILLS)}")
+    def _v(cls, v):
+        if v not in VALID_SKILLS: raise ValueError(f"Unknown skill: {v}")
         return v
 
-
 class SubQuestion(BaseModel):
-    """Depth: easier version targeting one skill."""
     question: str
     difficulty: int = Field(ge=1, le=10)
     target_skill: str
     answer: Optional[str] = None
-
     @field_validator("target_skill")
     @classmethod
-    def validate_target(cls, v: str) -> str:
-        if v not in VALID_SKILLS:
-            raise ValueError(f"'{v}' not in skill taxonomy")
+    def _v(cls, v):
+        if v not in VALID_SKILLS: raise ValueError(f"Unknown skill: {v}")
         return v
 
-
 class ContextVariation(BaseModel):
-    """Breadth: same core problem in different context."""
     context: str
     question: str
     mapping: str
-
     @field_validator("context")
     @classmethod
-    def validate_context(cls, v: str) -> str:
-        if v not in VALID_CONTEXTS:
-            raise ValueError(f"'{v}' not in context taxonomy. Valid: {VALID_CONTEXTS}")
+    def _v(cls, v):
+        if v not in VALID_CONTEXTS: raise ValueError(f"Unknown context: {v}")
         return v
 
+class Decomposition(BaseModel):
+    required_skills: List[Skill]
+    sub_questions: List[SubQuestion] = Field(min_length=3, max_length=6)
+    reasoning_steps: int = Field(ge=1)
 
-class QuestionDecomposition(BaseModel):
-    """Depth decomposition: skill tree + curriculum."""
-    required_skills: List[Skill] = Field(description="Skills needed, with prerequisites")
-    sub_questions: List[SubQuestion] = Field(
-        min_length=3, max_length=6,
-        description="Curriculum from easiest to hardest, building up to original"
-    )
-    reasoning_steps: int = Field(ge=1, description="Min reasoning steps to solve original")
+class Breadth(BaseModel):
+    core_concept: str
+    abstract_structure: str
+    variations: List[ContextVariation] = Field(min_length=3, max_length=5)
 
-
-class BreadthExpansion(BaseModel):
-    """Breadth expansion: same problem structure in different contexts."""
-    core_concept: str = Field(description="The fundamental concept being tested")
-    abstract_structure: str = Field(description="Abstract problem structure without domain specifics")
-    variations: List[ContextVariation] = Field(
-        min_length=3, max_length=5,
-        description="Same problem in different real-world contexts"
-    )
-
-
-class VerifiedAnswer(BaseModel):
-    """Output of Pass 2: Answer with verification."""
+class Answer(BaseModel):
     answer: str
     confidence: float = Field(ge=0, le=1)
     reasoning: str
 
-
-class DebateVerification(BaseModel):
-    """Output of debate verification."""
+class Verification(BaseModel):
     is_correct: bool
     critique: str
-    final_answer: Optional[str] = Field(None, description="Corrected answer if original was wrong")
+    final_answer: Optional[str] = None
 
-
-# =============================================================================
-# Prompts
-# =============================================================================
-
-DECOMPOSE_SYSTEM = f'''You are an expert at creating learning curricula from hard problems.
-
-Given a problem with its difficulty and progressive hints, create a skill-tree curriculum:
-1. Identify required skills (with prerequisites forming a DAG)
-2. Generate 3-6 sub-questions building up to the original
-   - Start ~3 difficulty levels below
-   - Each targets one skill
-   - Use the hints to inform what skills/concepts are needed
+# --- Prompts ---
+DECOMPOSE_PROMPT = f"""Create a skill-tree curriculum for this problem.
+1. Identify required skills (with prerequisites as DAG)
+2. Generate 3-6 sub-questions building up to original (start ~3 levels below)
 3. Count minimum reasoning steps
 
-## Skill Taxonomy (use ONLY these skill names):
-{flatten_skills()}
+Skills (use ONLY these):
+{_skill_list()}
 
-## Difficulty Calibration:
-{DIFFICULTY_CALIBRATION}
+Difficulty: {DIFFICULTY_GUIDE}
 
-Sub-questions must be SELF-CONTAINED. JSON only.'''
+Sub-questions must be SELF-CONTAINED. JSON only."""
 
-DECOMPOSE_SYSTEM_NO_HINTS = f'''You are an expert at creating learning curricula from hard problems.
+BREADTH_PROMPT = f"""Extract the core concept and generate variations in different contexts.
+Variations must test the SAME skill in different domains.
 
-Given a problem, create a skill-tree curriculum:
-1. Estimate difficulty (1-10) and identify required skills (with prerequisites)
-2. Generate 3-6 sub-questions building up to the original
-3. Count minimum reasoning steps
+Contexts (use ONLY these): {', '.join(CONTEXTS)}
 
-## Skill Taxonomy (use ONLY these skill names):
-{flatten_skills()}
+Each variation: same algorithm, self-contained, realistic. JSON only."""
 
-## Difficulty Calibration:
-{DIFFICULTY_CALIBRATION}
+ANSWER_PROMPT = "Solve step by step. JSON: {answer, confidence: 0-1, reasoning}"
+VERIFY_PROMPT = "Verify this answer rigorously. JSON: {is_correct, critique, final_answer or null}"
 
-Sub-questions must be SELF-CONTAINED. JSON only.'''
-
-ANSWER_SYSTEM = '''Solve step by step. Be precise.
-JSON: {answer: <final>, confidence: 0-1, reasoning: <steps>}'''
-
-DEBATE_SYSTEM = '''Verify this answer. Be rigorous.
-JSON: {is_correct: bool, critique: <explanation>, final_answer: <corrected or null>}'''
-
-BREADTH_SYSTEM = f'''You are an expert at recognizing abstract problem structures.
-
-Given a problem, extract its core concept and generate variations in different contexts.
-The variations must test the SAME underlying skill but in different domains.
-
-## Context Taxonomy (use ONLY these contexts):
-{', '.join(CONTEXT_TAXONOMY)}
-
-Each variation must be:
-1. Solvable using the exact same algorithm/approach
-2. Self-contained (no reference to original)
-3. Realistic in its domain
-
-JSON only.'''
-
-
-# =============================================================================
-# Decomposer
-# =============================================================================
-
-class QuestionDecomposer:
-    def __init__(
-        self,
-        base_url: str = "http://0.0.0.0:8000/v1",
-        api_key: str = "dummy",
-        model: Optional[str] = None,
-        max_concurrent: int = 64,
-        timeout: float = 120.0,
-        max_retries: int = 2,
-    ):
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.max_concurrent = max_concurrent
+# --- Decomposer ---
+class Decomposer:
+    def __init__(self, base_url="http://0.0.0.0:8000/v1", api_key="dummy",
+                 model=None, max_concurrent=64, timeout=120.0, retries=2):
         self.client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
-        self.model = model
+        self.model, self.timeout, self.retries = model, timeout, retries
+        self.max_concurrent = max_concurrent
 
-    async def _init_model(self):
+    async def _init(self):
         if not self.model:
-            try:
-                models = await self.client.models.list()
-                self.model = models.data[0].id
-            except Exception:
-                self.model = "unknown"
+            try: self.model = (await self.client.models.list()).data[0].id
+            except: self.model = "default"
 
-    async def _call(self, system: str, user: str, response_format: type) -> Optional[Any]:
-        for attempt in range(self.max_retries + 1):
+    async def _call(self, system: str, user: str, schema: type):
+        for i in range(self.retries + 1):
             try:
-                resp = await asyncio.wait_for(
+                r = await asyncio.wait_for(
                     self.client.beta.chat.completions.parse(
                         model=self.model,
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                        response_format=response_format,
-                        temperature=0.7,
-                    ),
-                    timeout=self.timeout,
-                )
-                return resp.choices[0].message.parsed
-            except Exception as e:
-                if attempt == self.max_retries:
-                    return None
-                await asyncio.sleep(0.5 * (2 ** attempt))
-        return None
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                        response_format=schema, temperature=0.7),
+                    timeout=self.timeout)
+                return r.choices[0].message.parsed
+            except Exception:
+                if i == self.retries: return None
+                await asyncio.sleep(0.5 * 2**i)
 
-    # -------------------------------------------------------------------------
-    # Pass 1: Decompose
-    # -------------------------------------------------------------------------
-    async def decompose(
-        self,
-        question: str,
-        solution: Optional[str] = None,
-        difficulty: Optional[int] = None,
-        hints: Optional[List[str]] = None,
-    ) -> Optional[QuestionDecomposition]:
-        # Build context with available info
-        context = f"## Problem\n{question}"
-        if difficulty:
-            context += f"\n\n## Difficulty: {difficulty}/10"
-        if hints:
-            context += "\n\n## Progressive Hints (easy→hard)"
-            for i, h in enumerate(hints, 1):
-                context += f"\n{i}. {h}"
-        if solution:
-            context += f"\n\n## Reference Solution\n{solution}"
+    async def decompose(self, q: str, sol: str = None, diff: int = None, hints: List[str] = None):
+        ctx = f"## Problem\n{q}"
+        if diff: ctx += f"\n\n## Difficulty: {diff}/10"
+        if hints: ctx += "\n\n## Hints\n" + "\n".join(f"{i}. {h}" for i, h in enumerate(hints, 1))
+        if sol: ctx += f"\n\n## Solution\n{sol}"
+        return await self._call(DECOMPOSE_PROMPT, ctx, Decomposition)
 
-        system = DECOMPOSE_SYSTEM if hints else DECOMPOSE_SYSTEM_NO_HINTS
-        return await self._call(system, context, QuestionDecomposition)
+    async def expand(self, q: str, sol: str = None):
+        ctx = f"## Problem\n{q}" + (f"\n\n## Solution\n{sol}" if sol else "")
+        return await self._call(BREADTH_PROMPT, ctx, Breadth)
 
-    # -------------------------------------------------------------------------
-    # Pass 2: Generate answers for sub-questions
-    # -------------------------------------------------------------------------
-    async def answer(self, question: str) -> Optional[VerifiedAnswer]:
-        return await self._call(ANSWER_SYSTEM, question, VerifiedAnswer)
+    async def solve(self, q: str):
+        return await self._call(ANSWER_PROMPT, q, Answer)
 
-    # -------------------------------------------------------------------------
-    # Pass 3: Debate verification
-    # -------------------------------------------------------------------------
-    async def verify(self, question: str, proposed_answer: str) -> Optional[DebateVerification]:
-        user = f"## Question\n{question}\n\n## Proposed Answer\n{proposed_answer}"
-        return await self._call(DEBATE_SYSTEM, user, DebateVerification)
+    async def verify(self, q: str, ans: str):
+        return await self._call(VERIFY_PROMPT, f"## Question\n{q}\n\n## Answer\n{ans}", Verification)
 
-    # -------------------------------------------------------------------------
-    # Breadth: Generate contextual variations
-    # -------------------------------------------------------------------------
-    async def expand_breadth(self, question: str, solution: Optional[str] = None) -> Optional[BreadthExpansion]:
-        context = f"## Problem\n{question}"
-        if solution:
-            context += f"\n\n## Solution Approach\n{solution}"
-        return await self._call(BREADTH_SYSTEM, context, BreadthExpansion)
+    async def process(self, q: str, sol: str = None, diff: int = None,
+                      hints: List[str] = None, breadth: bool = True) -> Dict[str, Any]:
+        """Process a single question. Returns full decomposition result."""
+        await self._init()
+        result = {"question": q, "difficulty": diff, "hints": hints, "success": False}
 
-    # -------------------------------------------------------------------------
-    # Full pipeline for one question
-    # -------------------------------------------------------------------------
-    async def process_one(
-        self,
-        question: str,
-        solution: Optional[str],
-        idx: int,
-        difficulty: Optional[int] = None,
-        hints: Optional[List[str]] = None,
-        include_breadth: bool = True,
-    ) -> Dict[str, Any]:
-        result = {
-            "index": idx,
-            "original_question": question,
-            "original_difficulty": difficulty,
-            "original_hints": hints,
-            "success": False,
-        }
-
-        # Pass 1: Decompose (reusing hints + difficulty if available)
-        decomp = await self.decompose(question, solution, difficulty, hints)
+        decomp = await self.decompose(q, sol, diff, hints)
         if not decomp:
             result["error"] = "decomposition_failed"
             return result
 
-        result["required_skills"] = [s.model_dump() for s in decomp.required_skills]
-        result["reasoning_steps"] = decomp.reasoning_steps
+        result["skills"] = [s.model_dump() for s in decomp.required_skills]
+        result["steps"] = decomp.reasoning_steps
 
-        # Pass 2 + 3: Answer and verify each sub-question
-        verified_subs = []
+        subs = []
         for sq in decomp.sub_questions:
-            sub_result = {
-                "question": sq.question,
-                "difficulty": sq.difficulty,
-                "target_skill": sq.target_skill,
-            }
-
-            # Generate answer
-            ans = await self.answer(sq.question)
-            if not ans:
-                sub_result["answer"] = None
-                sub_result["verified"] = False
-                sub_result["error"] = "answer_generation_failed"
-            else:
-                # Verify via debate
-                verification = await self.verify(sq.question, ans.answer)
-                if verification and verification.is_correct:
-                    sub_result["answer"] = ans.answer
-                    sub_result["verified"] = True
-                    sub_result["confidence"] = ans.confidence
-                elif verification and verification.final_answer:
-                    # Use corrected answer
-                    sub_result["answer"] = verification.final_answer
-                    sub_result["verified"] = True
-                    sub_result["was_corrected"] = True
+            sub = {"question": sq.question, "difficulty": sq.difficulty, "skill": sq.target_skill}
+            ans = await self.solve(sq.question)
+            if ans:
+                ver = await self.verify(sq.question, ans.answer)
+                if ver and ver.is_correct:
+                    sub.update(answer=ans.answer, verified=True, confidence=ans.confidence)
+                elif ver and ver.final_answer:
+                    sub.update(answer=ver.final_answer, verified=True, corrected=True)
                 else:
-                    sub_result["answer"] = ans.answer
-                    sub_result["verified"] = False
-                    sub_result["critique"] = verification.critique if verification else "verification_failed"
+                    sub.update(answer=ans.answer, verified=False,
+                              critique=ver.critique if ver else "failed")
+            else:
+                sub.update(answer=None, verified=False, error="solve_failed")
+            subs.append(sub)
+        result["sub_questions"] = subs
 
-            verified_subs.append(sub_result)
-
-        result["sub_questions"] = verified_subs
-
-        # Breadth expansion: same problem in different contexts
-        if include_breadth:
-            breadth = await self.expand_breadth(question, solution)
-            if breadth:
+        if breadth:
+            exp = await self.expand(q, sol)
+            if exp:
                 result["breadth"] = {
-                    "core_concept": breadth.core_concept,
-                    "abstract_structure": breadth.abstract_structure,
-                    "variations": [v.model_dump() for v in breadth.variations],
+                    "core": exp.core_concept,
+                    "abstract": exp.abstract_structure,
+                    "variations": [v.model_dump() for v in exp.variations]
                 }
 
         result["success"] = True
         return result
 
-    # -------------------------------------------------------------------------
-    # Continuous processing
-    # -------------------------------------------------------------------------
-    async def process_continuous(
-        self,
-        questions: List[str],
-        solutions: List[Optional[str]],
-        difficulties: List[Optional[int]],
-        hints_list: List[Optional[List[str]]],
-        pbar: Optional[tqdm] = None,
-        include_breadth: bool = True,
-    ) -> AsyncIterator[Dict[str, Any]]:
-        await self._init_model()
-        n = len(questions)
-        next_idx = 0
-        pending: Dict[asyncio.Task, int] = {}
+    async def process_batch(self, items: List[Dict], pbar=None, breadth=True) -> AsyncIterator[Dict]:
+        """Process batch with continuous batching."""
+        await self._init()
+        n, idx, pending = len(items), 0, {}
 
-        def submit(idx: int) -> asyncio.Task:
-            task = asyncio.create_task(
-                self.process_one(
-                    questions[idx], solutions[idx], idx,
-                    difficulties[idx], hints_list[idx], include_breadth
-                )
-            )
-            pending[task] = idx
-            return task
+        def submit(i):
+            it = items[i]
+            task = asyncio.create_task(self.process(
+                it["question"], it.get("solution"), it.get("difficulty"),
+                it.get("hints"), breadth))
+            pending[task] = i
 
-        while next_idx < n and len(pending) < self.max_concurrent:
-            submit(next_idx)
-            next_idx += 1
+        while idx < n and len(pending) < self.max_concurrent:
+            submit(idx); idx += 1
 
         while pending:
-            done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                del pending[task]
-                result = task.result()
-                if pbar:
-                    pbar.update(1)
-                yield result
-                if next_idx < n:
-                    submit(next_idx)
-                    next_idx += 1
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                i = pending.pop(t)
+                r = t.result()
+                r["index"] = i
+                if pbar: pbar.update(1)
+                yield r
+                if idx < n: submit(idx); idx += 1
 
 
-# =============================================================================
-# Skill Tree Aggregation
-# =============================================================================
+# --- Simple API ---
+def decompose_question(question: str, solution: str = None,
+                       base_url: str = "http://0.0.0.0:8000/v1",
+                       breadth: bool = True) -> Dict[str, Any]:
+    """
+    Decompose a single question into skills, sub-questions, and variations.
 
-def aggregate_skill_tree(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate skill requirements across all questions to build global skill tree."""
-    skill_counts: Dict[str, int] = {}
-    skill_levels: Dict[str, List[int]] = {}
-    skill_prereqs: Dict[str, set] = {}
+    Args:
+        question: The problem to decompose
+        solution: Optional reference solution
+        base_url: vLLM server URL
+        breadth: Whether to generate contextual variations
 
-    for r in results:
-        if not r.get("success"):
-            continue
-        for skill in r.get("required_skills", []):
-            name = skill["name"]
-            skill_counts[name] = skill_counts.get(name, 0) + 1
-            skill_levels.setdefault(name, []).append(skill["level"])
-            skill_prereqs.setdefault(name, set()).update(skill.get("prerequisites", []))
-
-    tree = {}
-    for name in skill_counts:
-        tree[name] = {
-            "count": skill_counts[name],
-            "avg_level": sum(skill_levels[name]) / len(skill_levels[name]),
-            "max_level": max(skill_levels[name]),
-            "prerequisites": list(skill_prereqs[name]),
-        }
-
-    sorted_skills = sorted(tree.items(), key=lambda x: -x[1]["count"])
-    return {"skills": dict(sorted_skills), "total_questions": len(results)}
+    Returns:
+        dict with keys: question, skills, steps, sub_questions, breadth, success
+    """
+    d = Decomposer(base_url=base_url)
+    return asyncio.run(d.process(question, solution, breadth=breadth))
 
 
-# =============================================================================
-# Visualization
-# =============================================================================
+# --- Visualization ---
+def render(r: Dict) -> str:
+    if not r.get("success"): return f"[ERROR] {r.get('error')}"
 
-def render_tree(result: Dict[str, Any]) -> str:
-    """Render decomposition as ASCII tree showing skills, depth curriculum, and breadth."""
-    if not result.get("success"):
-        return f"[ERROR] {result.get('error', 'unknown')}"
+    lines = [f"[L{r.get('difficulty', '?')}] {r['question'][:60]}...", f"│  steps={r.get('steps', '?')}"]
 
-    lines = []
-    q_short = result.get("original_question", "")[:60]
-    diff = result.get("original_difficulty", "?")
-    steps = result.get("reasoning_steps", "?")
+    skills = r.get("skills", [])
+    subs = r.get("sub_questions", [])
+    brd = r.get("breadth", {})
 
-    lines.append(f"[L{diff}] {q_short}...")
-    lines.append(f"│   (steps={steps})")
-
-    skills = result.get("required_skills", [])
-    subs = result.get("sub_questions", [])
-    breadth = result.get("breadth", {})
-    variations = breadth.get("variations", [])
-
-    has_subs = bool(subs)
-    has_breadth = bool(variations)
-
-    # Skills branch
     if skills:
-        branch = "├" if (has_subs or has_breadth) else "└"
-        lines.append(f"{branch}── SKILLS")
-        for i, sk in enumerate(skills):
-            is_last = (i == len(skills) - 1)
-            prefix = "│   " if (has_subs or has_breadth) else "    "
-            conn = "└" if is_last else "├"
-            prereqs = sk.get("prerequisites", [])
-            prereq_str = f" ← {','.join(prereqs)}" if prereqs else ""
-            lines.append(f"{prefix}{conn}── [{sk['level']:2d}] {sk['name']}{prereq_str}")
+        lines.append("├── SKILLS")
+        for i, s in enumerate(skills):
+            pre = " ← " + ",".join(s["prerequisites"]) if s.get("prerequisites") else ""
+            lines.append(f"{'│' if subs or brd else ' '}   {'└' if i==len(skills)-1 else '├'}── [{s['level']:2d}] {s['name']}{pre}")
 
-    # Depth branch
     if subs:
-        branch = "├" if has_breadth else "└"
-        lines.append(f"{branch}── DEPTH")
-        prefix = "│   " if has_breadth else "    "
+        lines.append(f"{'├' if brd else '└'}── DEPTH")
         for i, sq in enumerate(subs):
-            is_last = (i == len(subs) - 1)
-            conn = "└" if is_last else "├"
-            verified = "✓" if sq.get("verified") else "✗"
-            d = sq.get("difficulty", "?")
-            skill = sq.get("target_skill", "")[:20]
-            q_text = sq.get("question", "")[:45]
-            lines.append(f"{prefix}{conn}── {verified} [L{d}] ({skill})")
-            sub_prefix = prefix + ("    " if is_last else "│   ")
-            lines.append(f"{sub_prefix}{q_text}...")
+            v = "✓" if sq.get("verified") else "✗"
+            lines.append(f"{'│' if brd else ' '}   {'└' if i==len(subs)-1 else '├'}── {v} [L{sq['difficulty']}] {sq['skill']}")
+            lines.append(f"{'│' if brd else ' '}   {'  ' if i==len(subs)-1 else '│ '}   {sq['question'][:40]}...")
 
-    # Breadth branch
-    if variations:
-        core = breadth.get("core_concept", "?")
-        lines.append(f"└── BREADTH (core: {core})")
-        for i, var in enumerate(variations):
-            is_last = (i == len(variations) - 1)
-            conn = "└" if is_last else "├"
-            ctx = var.get("context", "?")
-            q_text = var.get("question", "")[:50]
-            lines.append(f"    {conn}── [{ctx}]")
-            sub_prefix = "        " if is_last else "    │   "
-            lines.append(f"{sub_prefix}{q_text}...")
+    if brd.get("variations"):
+        lines.append(f"└── BREADTH ({brd.get('core', '?')})")
+        for i, v in enumerate(brd["variations"]):
+            lines.append(f"    {'└' if i==len(brd['variations'])-1 else '├'}── [{v['context']}] {v['question'][:40]}...")
 
     return "\n".join(lines)
 
 
-def render_skill_dag(tree: Dict[str, Any], top_n: int = 20) -> str:
-    """Render global skill tree as ASCII DAG."""
-    skills = tree.get("skills", {})
-    if not skills:
-        return "[No skills]"
+def aggregate_skills(results: List[Dict]) -> Dict:
+    counts, levels, prereqs = {}, {}, {}
+    for r in results:
+        if not r.get("success"): continue
+        for s in r.get("skills", []):
+            n = s["name"]
+            counts[n] = counts.get(n, 0) + 1
+            levels.setdefault(n, []).append(s["level"])
+            prereqs.setdefault(n, set()).update(s.get("prerequisites", []))
 
-    lines = [f"SKILL DAG ({tree.get('total_questions', 0)} questions)", "=" * 50]
-
-    base_skills = []
-    derived_skills = []
-    for name, data in list(skills.items())[:top_n]:
-        if data.get("prerequisites"):
-            derived_skills.append((name, data))
-        else:
-            base_skills.append((name, data))
-
-    if base_skills:
-        lines.append("\nBASE SKILLS:")
-        for name, data in base_skills:
-            bar = "█" * min(int(data["count"] / 5) + 1, 20)
-            lines.append(f"  [{data['avg_level']:.0f}] {name:<25} n={data['count']:3d} {bar}")
-
-    if derived_skills:
-        lines.append("\nDERIVED SKILLS:")
-        for name, data in derived_skills:
-            prereqs = data.get("prerequisites", [])[:3]
-            bar = "█" * min(int(data["count"] / 5) + 1, 20)
-            lines.append(f"  [{data['avg_level']:.0f}] {name:<25} n={data['count']:3d} {bar}")
-            lines.append(f"       └─ requires: {' + '.join(prereqs)}")
-
-    return "\n".join(lines)
+    tree = {n: {"count": counts[n], "avg": sum(levels[n])/len(levels[n]),
+                "max": max(levels[n]), "prereqs": list(prereqs[n])}
+            for n in counts}
+    return {"skills": dict(sorted(tree.items(), key=lambda x: -x[1]["count"])),
+            "total": len(results)}
 
 
-def visualize_decomposition(result: Dict[str, Any], max_width: int = 80) -> str:
-    """Generate ASCII visualization of a decomposed question."""
-    if not result.get("success"):
-        return f"[FAILED] {result.get('error', 'unknown error')}"
-
-    lines = []
-    diff = result.get("original_difficulty", "?")
-    steps = result.get("reasoning_steps", "?")
-
-    # Header
-    lines.append("=" * max_width)
-    lines.append(f"QUESTION DECOMPOSITION  [Difficulty: {diff}/10, Steps: {steps}]")
-    lines.append("=" * max_width)
-
-    # Original question (truncated)
-    q = result.get("original_question", "")[:200]
-    lines.append(f"\n📋 ORIGINAL: {q}{'...' if len(result.get('original_question', '')) > 200 else ''}")
-
-    # Original hints if available
-    hints = result.get("original_hints")
-    if hints:
-        lines.append("\n💡 HINTS (from hint_generator):")
-        for i, h in enumerate(hints, 1):
-            lines.append(f"   {i}. {h[:70]}{'...' if len(h) > 70 else ''}")
-
-    # Skill tree
-    lines.append("\n🌳 SKILL TREE:")
-    skills = result.get("required_skills", [])
-    for skill in skills:
-        prereqs = skill.get("prerequisites", [])
-        prereq_str = f" ← requires: {', '.join(prereqs)}" if prereqs else ""
-        lines.append(f"   [{skill['level']:2d}] {skill['name']}{prereq_str}")
-
-    # Sub-questions curriculum
-    lines.append("\n📚 CURRICULUM (easy → hard):")
-    lines.append("   ┌" + "─" * 60)
-    subs = result.get("sub_questions", [])
-    for i, sq in enumerate(subs):
-        verified = "✓" if sq.get("verified") else "✗"
-        corrected = " (corrected)" if sq.get("was_corrected") else ""
-        skill = sq.get("target_skill", "?")
-        diff = sq.get("difficulty", "?")
-
-        lines.append(f"   │ Q{i+1} [L{diff}] ({skill})")
-        q_text = sq.get("question", "")[:55]
-        lines.append(f"   │    {q_text}{'...' if len(sq.get('question', '')) > 55 else ''}")
-
-        ans = sq.get("answer")
-        if ans:
-            ans_text = str(ans)[:50]
-            lines.append(f"   │    → {verified} {ans_text}{corrected}")
-        else:
-            lines.append(f"   │    → {verified} [no answer]")
-
-        if i < len(subs) - 1:
-            lines.append("   │")
-            lines.append("   ▼")
-
-    lines.append("   └" + "─" * 60)
-
-    # Breadth variations
-    breadth = result.get("breadth", {})
-    variations = breadth.get("variations", [])
-    if variations:
-        core = breadth.get("core_concept", "?")
-        abstract = breadth.get("abstract_structure", "")[:60]
-        lines.append(f"\n🔀 BREADTH VARIATIONS (core: {core})")
-        lines.append(f"   Abstract: {abstract}{'...' if len(breadth.get('abstract_structure', '')) > 60 else ''}")
-        lines.append("   ┌" + "─" * 60)
-        for i, var in enumerate(variations):
-            ctx = var.get("context", "?")
-            q_text = var.get("question", "")[:50]
-            mapping = var.get("mapping", "")[:40]
-            lines.append(f"   │ [{ctx}]")
-            lines.append(f"   │    {q_text}{'...' if len(var.get('question', '')) > 50 else ''}")
-            lines.append(f"   │    ↔ {mapping}")
-            if i < len(variations) - 1:
-                lines.append("   │")
-        lines.append("   └" + "─" * 60)
-
-    lines.append("")
-    return "\n".join(lines)
-
-
-def visualize_skill_tree(tree: Dict[str, Any], top_n: int = 15) -> str:
-    """Visualize global skill tree aggregation."""
-    lines = []
-    lines.append("=" * 70)
-    lines.append(f"GLOBAL SKILL TREE  [{tree.get('total_questions', 0)} questions analyzed]")
-    lines.append("=" * 70)
-
-    skills = tree.get("skills", {})
-    for i, (name, data) in enumerate(list(skills.items())[:top_n]):
-        count = data["count"]
-        avg = data["avg_level"]
-        max_lvl = data["max_level"]
-        prereqs = data.get("prerequisites", [])
-
-        bar_len = int(count / max(s["count"] for s in skills.values()) * 30)
-        bar = "█" * bar_len
-
-        lines.append(f"\n{name}")
-        lines.append(f"   Count: {count:4d} {bar}")
-        lines.append(f"   Level: avg={avg:.1f}, max={max_lvl}")
-        if prereqs:
-            lines.append(f"   Requires: {', '.join(prereqs[:5])}")
-
-    if len(skills) > top_n:
-        lines.append(f"\n... and {len(skills) - top_n} more skills")
-
-    return "\n".join(lines)
-
-
-# =============================================================================
-# Main
-# =============================================================================
-
-def extract_problem(row: Dict[str, Any]) -> str:
-    prompt = row.get("prompt")
-    if isinstance(prompt, list) and prompt:
-        msg = prompt[0]
-        if isinstance(msg, dict):
-            return msg.get("content", "")
-    return str(prompt) if prompt else ""
-
-
-def extract_solution(row: Dict[str, Any]) -> Optional[str]:
-    rm = row.get("reward_model")
-    if isinstance(rm, dict):
-        gt = rm.get("ground_truth")
-        if not gt:
-            return None
-        return gt if isinstance(gt, str) else json.dumps(gt)
-    sol = row.get("solution") or row.get("answer") or row.get("ground_truth")
-    if sol:
-        return sol if isinstance(sol, str) else json.dumps(sol)
-    return None
-
-
-def extract_hints(row: Dict[str, Any]) -> Optional[List[str]]:
-    """Extract hints from enriched parquet row."""
+# --- CLI ---
+def _extract(row):
+    p = row.get("prompt")
+    q = p[0].get("content", "") if isinstance(p, list) and p and isinstance(p[0], dict) else str(p or "")
+    rm = row.get("reward_model", {})
+    sol = rm.get("ground_truth") if isinstance(rm, dict) else row.get("solution")
     hints = row.get("hints")
-    if not hints:
-        return None
     if isinstance(hints, str):
-        try:
-            return json.loads(hints)
-        except Exception:
-            return None
-    if isinstance(hints, list):
-        return hints
-    return None
-
-
-def extract_difficulty(row: Dict[str, Any]) -> Optional[int]:
-    """Extract difficulty from enriched parquet row."""
+        try: hints = json.loads(hints)
+        except: hints = None
     diff = row.get("estimated_difficulty")
-    if diff is None:
-        return None
-    try:
-        return int(diff)
-    except Exception:
-        return None
+    return {"question": q, "solution": sol, "hints": hints, "difficulty": int(diff) if diff else None}
 
 
-async def process_parquet(
-    input_path: str,
-    output_dir: str,
-    decomposer: QuestionDecomposer,
-    chunk_size: int = 500,
-    filter_difficulty: Optional[int] = None,
-    include_breadth: bool = True,
-):
+async def _run(args):
     import pandas as pd
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.visualize:
+        data = ([json.loads(l) for l in open(args.input) if l.strip()]
+                if args.input.endswith(".jsonl")
+                else [pd.read_parquet(args.input).iloc[i].to_dict()
+                      for i in range(len(pd.read_parquet(args.input)))])
+        for r in [d for d in data if d.get("success")][:args.visualize]:
+            print(render(r), "\n")
+        return
 
-    df = pd.read_parquet(input_path)
-    n = len(df)
-    print(f"Loaded {n} rows from {input_path}")
+    df = pd.read_parquet(args.input)
+    items = [_extract(df.iloc[i].to_dict()) for i in range(len(df))]
+    if args.min_diff:
+        items = [it for it in items if (it.get("difficulty") or 0) >= args.min_diff]
 
-    rows = [df.iloc[i].to_dict() for i in range(n)]
-    questions = [extract_problem(r) for r in rows]
-    solutions = [extract_solution(r) for r in rows]
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
 
-    # Extract pre-computed hints and difficulty (from hint_generator.py)
-    difficulties = [extract_difficulty(r) for r in rows]
-    hints_list = [extract_hints(r) for r in rows]
+    d = Decomposer(args.base_url, args.api_key, args.model, args.concurrent, args.timeout)
+    results, chunk, cidx = {}, [], 0
 
-    has_hints = sum(1 for h in hints_list if h)
-    has_diff = sum(1 for d in difficulties if d)
-    print(f"  Found {has_diff} with difficulty, {has_hints} with hints (from hint_generator)")
-
-    # Filter by difficulty if requested
-    if filter_difficulty and has_diff > 0:
-        indices = [i for i in range(n) if (difficulties[i] or 0) >= filter_difficulty]
-        print(f"Filtering to {len(indices)} questions with difficulty >= {filter_difficulty}")
-        questions = [questions[i] for i in indices]
-        solutions = [solutions[i] for i in indices]
-        difficulties = [difficulties[i] for i in indices]
-        hints_list = [hints_list[i] for i in indices]
-        rows = [rows[i] for i in indices]
-        n = len(questions)
-
-    results: Dict[int, Dict] = {}
-    chunk_idx = 0
-    last_saved = 0
-
-    def save_chunk(start: int, end: int):
-        nonlocal chunk_idx
-        chunk_path = output_dir / f"decomposed_{chunk_idx:04d}.jsonl"
-        with open(chunk_path, "w") as f:
-            for i in range(start, end):
-                if i in results:
-                    f.write(json.dumps(results[i], default=str) + "\n")
-        print(f"\nSaved {chunk_path}")
-        chunk_idx += 1
-
-    pbar = tqdm(total=n, desc="Decomposing questions", unit="q")
-
-    async for result in decomposer.process_continuous(questions, solutions, difficulties, hints_list, pbar, include_breadth):
-        results[result["index"]] = result
-
-        while last_saved in results:
-            last_saved += 1
-        if last_saved > 0 and last_saved % chunk_size == 0:
-            save_chunk(last_saved - chunk_size, last_saved)
-
+    pbar = tqdm(total=len(items), desc="Processing")
+    async for r in d.process_batch(items, pbar, not args.no_breadth):
+        results[r["index"]] = r
+        chunk.append(r)
+        if len(chunk) >= args.chunk:
+            with open(out / f"chunk_{cidx:04d}.jsonl", "w") as f:
+                for c in chunk: f.write(json.dumps(c, default=str) + "\n")
+            chunk, cidx = [], cidx + 1
     pbar.close()
 
-    if last_saved % chunk_size != 0:
-        save_chunk((last_saved // chunk_size) * chunk_size, last_saved)
+    if chunk:
+        with open(out / f"chunk_{cidx:04d}.jsonl", "w") as f:
+            for c in chunk: f.write(json.dumps(c, default=str) + "\n")
 
-    # Aggregate skill tree
-    all_results = [results[i] for i in range(n) if i in results]
-    skill_tree = aggregate_skill_tree(all_results)
+    tree = aggregate_skills(list(results.values()))
+    with open(out / "skills.json", "w") as f: json.dump(tree, f, indent=2)
 
-    tree_path = output_dir / "skill_tree.json"
-    with open(tree_path, "w") as f:
-        json.dump(skill_tree, f, indent=2)
-    print(f"\nSkill tree: {tree_path}")
-    print(visualize_skill_tree(skill_tree))
-
-    # Save sample visualizations
-    success_results = [r for r in all_results if r.get("success")]
-    if success_results:
-        sample_path = output_dir / "sample_trees.txt"
-        with open(sample_path, "w") as f:
-            for i, r in enumerate(success_results[:5]):
-                f.write(f"{'='*60}\nSAMPLE {i+1}\n{'='*60}\n")
-                f.write(render_tree(r) + "\n\n")
-            f.write(f"{'='*60}\n")
-            f.write(render_skill_dag(skill_tree))
-        print(f"\nSample trees: {sample_path}")
-
-    success = len(success_results)
-    print(f"\nDone: {success}/{n} successfully decomposed")
+    ok = sum(1 for r in results.values() if r.get("success"))
+    print(f"\nDone: {ok}/{len(items)} successful")
 
 
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("input_file", help="Input parquet or JSONL (enriched or decomposed)")
-    p.add_argument("output_dir", nargs="?", default="./decomposed", help="Output directory")
+    p.add_argument("input")
+    p.add_argument("output", nargs="?", default="./out")
     p.add_argument("--base-url", default="http://0.0.0.0:8000/v1")
     p.add_argument("--api-key", default="dummy")
     p.add_argument("--model", default=None)
-    p.add_argument("--max-concurrent", type=int, default=32)
-    p.add_argument("--chunk-size", type=int, default=500)
-    p.add_argument("--timeout", type=float, default=180.0)
-    p.add_argument("--min-difficulty", type=int, default=None, help="Only process questions >= this difficulty")
-    p.add_argument("--no-breadth", action="store_true", help="Skip breadth expansion (faster)")
-    p.add_argument("--visualize", type=int, default=None, metavar="N", help="Just visualize N samples from decomposed JSONL, don't process")
-    p.add_argument("--tree", action="store_true", help="Use compact tree format (with --visualize)")
-    args = p.parse_args()
-
-    # Visualize mode: just show samples from already-decomposed data
-    if args.visualize is not None:
-        if args.input_file.endswith(".jsonl"):
-            with open(args.input_file) as f:
-                data = [json.loads(line) for line in f if line.strip()]
-        else:
-            import pandas as pd
-            df = pd.read_parquet(args.input_file)
-            data = [df.iloc[i].to_dict() for i in range(len(df))]
-
-        success = [d for d in data if d.get("success")]
-        print(f"Loaded {len(data)} results, {len(success)} successful\n")
-
-        for r in success[:args.visualize]:
-            if args.tree:
-                print(render_tree(r))
-            else:
-                print(visualize_decomposition(r))
-            print()
-        return
-
-    # Full processing mode
-    decomposer = QuestionDecomposer(
-        base_url=args.base_url,
-        api_key=args.api_key,
-        model=args.model,
-        max_concurrent=args.max_concurrent,
-        timeout=args.timeout,
-    )
-
-    asyncio.run(process_parquet(
-        args.input_file,
-        args.output_dir,
-        decomposer,
-        args.chunk_size,
-        args.min_difficulty,
-        include_breadth=not args.no_breadth,
-    ))
+    p.add_argument("--concurrent", type=int, default=32)
+    p.add_argument("--chunk", type=int, default=500)
+    p.add_argument("--timeout", type=float, default=180)
+    p.add_argument("--min-diff", type=int, default=None)
+    p.add_argument("--no-breadth", action="store_true")
+    p.add_argument("--visualize", type=int, default=None)
+    asyncio.run(_run(p.parse_args()))
 
 
 if __name__ == "__main__":
