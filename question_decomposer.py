@@ -232,23 +232,17 @@ class Decomposer:
 
 
 # --- Simple API ---
-def decompose_question(question: str, solution: str = None,
-                       base_url: str = "http://0.0.0.0:8000/v1",
-                       breadth: bool = True) -> Dict[str, Any]:
+async def decompose_question(question: str, solution: str = None,
+                             base_url: str = "http://0.0.0.0:8000/v1",
+                             breadth: bool = True) -> Dict[str, Any]:
     """
     Decompose a single question into skills, sub-questions, and variations.
 
-    Args:
-        question: The problem to decompose
-        solution: Optional reference solution
-        base_url: vLLM server URL
-        breadth: Whether to generate contextual variations
-
-    Returns:
-        dict with keys: question, skills, steps, sub_questions, breadth, success
+    In Jupyter: result = await decompose_question("...")
+    In scripts: result = asyncio.run(decompose_question("..."))
     """
     d = Decomposer(base_url=base_url)
-    return asyncio.run(d.process(question, solution, breadth=breadth))
+    return await d.process(question, solution, breadth=breadth)
 
 
 # --- Visualization ---
