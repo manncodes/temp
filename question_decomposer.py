@@ -148,26 +148,35 @@ GOOD example: "Prove that for any odd prime p, p² ≡ 1 (mod 8)" (self-containe
 
 JSON only."""
 
-BREADTH_PROMPT = f"""Generate variations of this problem in different real-world contexts.
+BREADTH_PROMPT = f"""Generate STRUCTURALLY DIFFERENT problems that test the same core skill.
 
-CRITICAL: Variations must differ STRUCTURALLY, not just relabel variables.
+CRITICAL: DO NOT just relabel variables or change the domain. The mathematical structure must CHANGE.
 
-Good variation: Changes constraints, adds/removes conditions, different goal
-Bad variation: Same problem with "stocks" instead of "numbers"
+TYPES OF STRUCTURAL VARIATION (pick different ones for each):
+1. TRANSFORM: Change the formula (p²+2 → p²-2, 2p+1, p³+4, p+p², etc.)
+2. GOAL: Change what's asked (find all → count how many → find smallest → prove none exist)
+3. DIRECTION: Reverse the problem (given output, find input)
+4. CONSTRAINT: Add/remove conditions (consecutive, bounded, distinct, coprime)
+5. GENERALIZE: Make it parametric (for which k does p²+k work?)
+6. COMPOSITION: Combine with another operation (apply twice, alternate)
 
-CONTEXTS (use ONLY these): {', '.join(CONTEXTS)}
+BAD VARIATION (just relabeling):
+  Original: "Find primes p where p²+2 is prime"
+  Bad: "Find atomic numbers Z where Z²+2 is prime" ← SAME FORMULA
 
-For each variation specify:
-- context: the domain
-- question: complete self-contained problem
-- constraint_twist: what structural element differs (NOT just domain mapping)
+GOOD VARIATIONS:
+  - "Find primes p where p²-2 is prime" (different formula)
+  - "Count primes p<1000 where p²+2 is prime" (count vs list)
+  - "Find the smallest k such that 3²+k is prime" (reversed)
+  - "Find consecutive primes p,q where p²+q² is prime" (composition)
+  - "Prove: for any prime p>3, p²+2 is composite" (prove vs find)
 
-Example constraint twists:
-- "discrete vs continuous"
-- "minimize vs maximize"
-- "existence vs counting"
-- "bounded vs unbounded domain"
-- "additional constraint: values must be distinct"
+CONTEXTS (use for realistic framing, NOT the core structure): {', '.join(CONTEXTS)}
+
+For each variation:
+- context: domain for realistic framing
+- question: complete problem with DIFFERENT STRUCTURE
+- constraint_twist: which structural change type you used
 
 JSON only."""
 
