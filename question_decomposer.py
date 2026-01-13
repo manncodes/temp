@@ -2,10 +2,10 @@
 Question decomposer for RL curriculum generation.
 Decomposes hard problems into skill trees, sub-questions, and contextual variations.
 """
-import asyncio, json, os
+import asyncio, json, os, re
 from typing import List, Optional, Dict, Any, AsyncIterator
 from pathlib import Path
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from openai import AsyncOpenAI
 from tqdm import tqdm
 
@@ -36,9 +36,6 @@ CONTEXTS = ["finance", "physics", "biology", "chemistry", "computer_science",
 VALID_SKILLS = {s for cat in SKILLS.values() for s in cat}
 VALID_CONTEXTS = set(CONTEXTS)
 
-DIFFICULTY_GUIDE = """L1-2: Single concept, 1-2 steps | L3-4: Two concepts, 3-4 steps
-L5-6: Multiple concepts, 5-7 steps | L7-8: Complex, 8-12 steps | L9-10: Competition level"""
-
 def _skill_list() -> str:
     return "\n".join(f"  {k}: {', '.join(v)}" for k, v in SKILLS.items())
 
@@ -57,17 +54,23 @@ class SubQuestion(BaseModel):
     question: str
     difficulty: int = Field(ge=1, le=10)
     target_skill: str
-    answer: Optional[str] = None
     @field_validator("target_skill")
     @classmethod
     def _v(cls, v):
         if v not in VALID_SKILLS: raise ValueError(f"Unknown skill: {v}")
         return v
+    @field_validator("question")
+    @classmethod
+    def _check_self_contained(cls, v):
+        bad = ["previous", "above", "earlier", "last question", "prior", "result of"]
+        if any(b in v.lower() for b in bad):
+            raise ValueError("Sub-question references other questions - must be self-contained")
+        return v
 
 class ContextVariation(BaseModel):
     context: str
     question: str
-    mapping: str
+    constraint_twist: str = Field(description="What constraint/structure differs from original")
     @field_validator("context")
     @classmethod
     def _v(cls, v):
@@ -75,13 +78,21 @@ class ContextVariation(BaseModel):
         return v
 
 class Decomposition(BaseModel):
-    required_skills: List[Skill]
-    sub_questions: List[SubQuestion] = Field(min_length=3, max_length=6)
+    estimated_difficulty: int = Field(ge=1, le=10, description="Difficulty of ORIGINAL problem")
+    core_skills: List[Skill] = Field(min_length=2, max_length=4, description="2-4 core skills only")
+    sub_questions: List[SubQuestion] = Field(min_length=3, max_length=5)
     reasoning_steps: int = Field(ge=1)
+    @model_validator(mode="after")
+    def _check_progression(self):
+        diffs = [sq.difficulty for sq in self.sub_questions]
+        if diffs != sorted(diffs):
+            raise ValueError("Sub-questions must be ordered easy→hard")
+        if diffs[-1] >= self.estimated_difficulty:
+            raise ValueError("Final sub-question must be easier than original")
+        return self
 
 class Breadth(BaseModel):
     core_concept: str
-    abstract_structure: str
     variations: List[ContextVariation] = Field(min_length=3, max_length=5)
 
 class Answer(BaseModel):
@@ -95,32 +106,74 @@ class Verification(BaseModel):
     final_answer: Optional[str] = None
 
 # --- Prompts ---
-DECOMPOSE_PROMPT = f"""Create a skill-tree curriculum for this problem.
-1. Identify required skills (with prerequisites as DAG)
-2. Generate 3-6 sub-questions building up to original (start ~3 levels below)
-3. Count minimum reasoning steps
+DECOMPOSE_PROMPT = f"""Analyze this problem and create a learning curriculum.
 
-Skills (use ONLY these):
+TASK:
+1. Estimate original difficulty (1-10 scale below)
+2. Identify 2-4 CORE skills (not generic ones like "logic" or "basic_algebra")
+3. Create 3-5 sub-questions as stepping stones (each MUST be self-contained)
+4. Order sub-questions strictly easy→hard
+
+DIFFICULTY SCALE:
+- L1-2: Direct formula application, 1-2 steps
+- L3-4: Two concepts combined, requires some insight
+- L5-6: Multiple concepts, non-obvious approach needed
+- L7-8: Complex integration, key insight required, 8+ steps
+- L9-10: Competition/olympiad level, creative leaps needed
+
+SKILLS (use ONLY from this list, pick 2-4 most specific):
 {_skill_list()}
 
-Difficulty: {DIFFICULTY_GUIDE}
+CRITICAL RULES:
+- Each sub-question MUST be solvable WITHOUT seeing other sub-questions
+- NO phrases like "using the previous result", "from above", "as shown earlier"
+- Start sub-questions ~3 levels below original difficulty
+- Put simple verification cases FIRST (e.g., "check n=1,2,3" before general proof)
+- Avoid generic skills like "logic", "basic_algebra" unless truly core
 
-Sub-questions must be SELF-CONTAINED. JSON only."""
+BAD example: "Using the result from Q2, prove..." (references Q2)
+GOOD example: "Prove that for any odd prime p, p² ≡ 1 (mod 8)" (self-contained)
 
-BREADTH_PROMPT = f"""Extract the core concept and generate variations in different contexts.
-Variations must test the SAME skill in different domains.
+JSON only."""
 
-Contexts (use ONLY these): {', '.join(CONTEXTS)}
+BREADTH_PROMPT = f"""Generate variations of this problem in different real-world contexts.
 
-Each variation: same algorithm, self-contained, realistic. JSON only."""
+CRITICAL: Variations must differ STRUCTURALLY, not just relabel variables.
 
-ANSWER_PROMPT = "Solve step by step. JSON: {answer, confidence: 0-1, reasoning}"
-VERIFY_PROMPT = "Verify this answer rigorously. JSON: {is_correct, critique, final_answer or null}"
+Good variation: Changes constraints, adds/removes conditions, different goal
+Bad variation: Same problem with "stocks" instead of "numbers"
+
+CONTEXTS (use ONLY these): {', '.join(CONTEXTS)}
+
+For each variation specify:
+- context: the domain
+- question: complete self-contained problem
+- constraint_twist: what structural element differs (NOT just domain mapping)
+
+Example constraint twists:
+- "discrete vs continuous"
+- "minimize vs maximize"
+- "existence vs counting"
+- "bounded vs unbounded domain"
+- "additional constraint: values must be distinct"
+
+JSON only."""
+
+ANSWER_PROMPT = """Solve step by step, showing all work.
+JSON format: {"answer": "<final answer>", "confidence": <0-1>, "reasoning": "<detailed steps>"}
+If answer is numeric, just give the number. If proof, summarize conclusion."""
+
+VERIFY_PROMPT = """Verify this solution rigorously. Check:
+1. Are all steps logically valid?
+2. Are edge cases handled?
+3. Is the final answer correct?
+
+JSON: {"is_correct": true/false, "critique": "<specific issues or 'correct'>", "final_answer": "<corrected answer if wrong, else null>"}"""
 
 # --- Decomposer ---
 class Decomposer:
     def __init__(self, base_url="http://0.0.0.0:8000/v1", api_key="dummy",
-                 model=None, max_concurrent=64, timeout=120.0, retries=2):
+                 model=None, max_concurrent=64, timeout=120.0, retries=3):
         self.client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
         self.model, self.timeout, self.retries = model, timeout, retries
         self.max_concurrent = max_concurrent
@@ -130,51 +183,52 @@ class Decomposer:
             try: self.model = (await self.client.models.list()).data[0].id
             except: self.model = "default"
 
-    async def _call(self, system: str, user: str, schema: type):
+    async def _call(self, system: str, user: str, schema: type, temp=0.7):
         for i in range(self.retries + 1):
             try:
                 r = await asyncio.wait_for(
                     self.client.beta.chat.completions.parse(
                         model=self.model,
                         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                        response_format=schema, temperature=0.7),
+                        response_format=schema, temperature=temp),
                     timeout=self.timeout)
                 return r.choices[0].message.parsed
-            except Exception:
+            except Exception as e:
                 if i == self.retries: return None
                 await asyncio.sleep(0.5 * 2**i)
 
     async def decompose(self, q: str, sol: str = None, diff: int = None, hints: List[str] = None):
         ctx = f"## Problem\n{q}"
-        if diff: ctx += f"\n\n## Difficulty: {diff}/10"
+        if diff: ctx += f"\n\n## Known Difficulty: {diff}/10"
         if hints: ctx += "\n\n## Hints\n" + "\n".join(f"{i}. {h}" for i, h in enumerate(hints, 1))
-        if sol: ctx += f"\n\n## Solution\n{sol}"
+        if sol: ctx += f"\n\n## Reference Solution\n{sol}"
         return await self._call(DECOMPOSE_PROMPT, ctx, Decomposition)
 
     async def expand(self, q: str, sol: str = None):
-        ctx = f"## Problem\n{q}" + (f"\n\n## Solution\n{sol}" if sol else "")
-        return await self._call(BREADTH_PROMPT, ctx, Breadth)
+        ctx = f"## Problem\n{q}" + (f"\n\n## Solution Approach\n{sol}" if sol else "")
+        return await self._call(BREADTH_PROMPT, ctx, Breadth, temp=0.9)
 
     async def solve(self, q: str):
-        return await self._call(ANSWER_PROMPT, q, Answer)
+        return await self._call(ANSWER_PROMPT, q, Answer, temp=0.3)
 
     async def verify(self, q: str, ans: str):
-        return await self._call(VERIFY_PROMPT, f"## Question\n{q}\n\n## Answer\n{ans}", Verification)
+        return await self._call(VERIFY_PROMPT, f"## Question\n{q}\n\n## Proposed Answer\n{ans}", Verification, temp=0.2)
 
     async def process(self, q: str, sol: str = None, diff: int = None,
                       hints: List[str] = None, breadth: bool = True) -> Dict[str, Any]:
-        """Process a single question. Returns full decomposition result."""
         await self._init()
-        result = {"question": q, "difficulty": diff, "hints": hints, "success": False}
+        result = {"question": q, "success": False}
 
         decomp = await self.decompose(q, sol, diff, hints)
         if not decomp:
             result["error"] = "decomposition_failed"
             return result
 
-        result["skills"] = [s.model_dump() for s in decomp.required_skills]
+        result["difficulty"] = decomp.estimated_difficulty
+        result["skills"] = [s.model_dump() for s in decomp.core_skills]
         result["steps"] = decomp.reasoning_steps
 
+        # Process sub-questions with solve+verify
         subs = []
         for sq in decomp.sub_questions:
             sub = {"question": sq.question, "difficulty": sq.difficulty, "skill": sq.target_skill}
@@ -187,7 +241,7 @@ class Decomposer:
                     sub.update(answer=ver.final_answer, verified=True, corrected=True)
                 else:
                     sub.update(answer=ans.answer, verified=False,
-                              critique=ver.critique if ver else "failed")
+                              critique=ver.critique if ver else "verification_failed")
             else:
                 sub.update(answer=None, verified=False, error="solve_failed")
             subs.append(sub)
@@ -198,7 +252,6 @@ class Decomposer:
             if exp:
                 result["breadth"] = {
                     "core": exp.core_concept,
-                    "abstract": exp.abstract_structure,
                     "variations": [v.model_dump() for v in exp.variations]
                 }
 
@@ -206,7 +259,6 @@ class Decomposer:
         return result
 
     async def process_batch(self, items: List[Dict], pbar=None, breadth=True) -> AsyncIterator[Dict]:
-        """Process batch with continuous batching."""
         await self._init()
         n, idx, pending = len(items), 0, {}
 
@@ -259,19 +311,24 @@ def render(r: Dict) -> str:
         lines.append("├── SKILLS")
         for i, s in enumerate(skills):
             pre = " ← " + ",".join(s["prerequisites"]) if s.get("prerequisites") else ""
-            lines.append(f"{'│' if subs or brd else ' '}   {'└' if i==len(skills)-1 else '├'}── [{s['level']:2d}] {s['name']}{pre}")
+            c = "└" if i == len(skills)-1 else "├"
+            lines.append(f"{'│' if subs or brd else ' '}   {c}── [{s['level']:2d}] {s['name']}{pre}")
 
     if subs:
-        lines.append(f"{'├' if brd else '└'}── DEPTH")
+        lines.append(f"{'├' if brd else '└'}── CURRICULUM")
         for i, sq in enumerate(subs):
             v = "✓" if sq.get("verified") else "✗"
-            lines.append(f"{'│' if brd else ' '}   {'└' if i==len(subs)-1 else '├'}── {v} [L{sq['difficulty']}] {sq['skill']}")
-            lines.append(f"{'│' if brd else ' '}   {'  ' if i==len(subs)-1 else '│ '}   {sq['question'][:40]}...")
+            c = "└" if i == len(subs)-1 else "├"
+            lines.append(f"{'│' if brd else ' '}   {c}── {v} [L{sq['difficulty']}] {sq['skill']}")
+            lines.append(f"{'│' if brd else ' '}   {'  ' if i==len(subs)-1 else '│ '}   {sq['question'][:45]}...")
 
     if brd.get("variations"):
-        lines.append(f"└── BREADTH ({brd.get('core', '?')})")
+        lines.append(f"└── VARIATIONS ({brd.get('core', '?')})")
         for i, v in enumerate(brd["variations"]):
-            lines.append(f"    {'└' if i==len(brd['variations'])-1 else '├'}── [{v['context']}] {v['question'][:40]}...")
+            c = "└" if i == len(brd["variations"])-1 else "├"
+            twist = v.get("constraint_twist", "")[:25]
+            lines.append(f"    {c}── [{v['context']}] {twist}")
+            lines.append(f"    {'  ' if i==len(brd['variations'])-1 else '│ '}   {v['question'][:40]}...")
 
     return "\n".join(lines)
 
