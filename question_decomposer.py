@@ -39,7 +39,7 @@ VALID_CONTEXTS = set(CONTEXTS)
 def _skill_list() -> str:
     return "\n".join(f"  {k}: {', '.join(v)}" for k, v in SKILLS.items())
 
-# --- Schemas ---
+# --- Schemas (lenient versions for retry) ---
 class Skill(BaseModel):
     name: str
     level: int = Field(ge=1, le=10)
@@ -59,28 +59,33 @@ class SubQuestion(BaseModel):
     def _v(cls, v):
         if v not in VALID_SKILLS: raise ValueError(f"Unknown skill: {v}")
         return v
+
+class SubQuestionStrict(SubQuestion):
+    """Strict version that validates self-containment."""
     @field_validator("question")
     @classmethod
     def _check_self_contained(cls, v):
         bad = ["previous", "above", "earlier", "last question", "prior", "result of"]
         if any(b in v.lower() for b in bad):
-            raise ValueError("Sub-question references other questions - must be self-contained")
+            raise ValueError("Sub-question references other questions")
         return v
 
 class ContextVariation(BaseModel):
     context: str
     question: str
-    constraint_twist: str = Field(description="What constraint/structure differs from original")
+    constraint_twist: Optional[str] = None
+    mapping: Optional[str] = None  # fallback for old format
     @field_validator("context")
     @classmethod
     def _v(cls, v):
         if v not in VALID_CONTEXTS: raise ValueError(f"Unknown context: {v}")
         return v
 
-class Decomposition(BaseModel):
-    estimated_difficulty: int = Field(ge=1, le=10, description="Difficulty of ORIGINAL problem")
-    core_skills: List[Skill] = Field(min_length=2, max_length=4, description="2-4 core skills only")
-    sub_questions: List[SubQuestion] = Field(min_length=3, max_length=5)
+class DecompositionStrict(BaseModel):
+    """Strict schema - used first attempt."""
+    estimated_difficulty: int = Field(ge=1, le=10)
+    core_skills: List[Skill] = Field(min_length=2, max_length=4)
+    sub_questions: List[SubQuestionStrict] = Field(min_length=3, max_length=5)
     reasoning_steps: int = Field(ge=1)
     @model_validator(mode="after")
     def _check_progression(self):
@@ -91,9 +96,16 @@ class Decomposition(BaseModel):
             raise ValueError("Final sub-question must be easier than original")
         return self
 
+class DecompositionLenient(BaseModel):
+    """Lenient schema - used on retry."""
+    estimated_difficulty: int = Field(ge=1, le=10, default=5)
+    core_skills: List[Skill] = Field(default_factory=list)
+    sub_questions: List[SubQuestion] = Field(default_factory=list)
+    reasoning_steps: int = Field(ge=1, default=3)
+
 class Breadth(BaseModel):
     core_concept: str
-    variations: List[ContextVariation] = Field(min_length=3, max_length=5)
+    variations: List[ContextVariation] = Field(default_factory=list)
 
 class Answer(BaseModel):
     answer: str
@@ -202,7 +214,15 @@ class Decomposer:
         if diff: ctx += f"\n\n## Known Difficulty: {diff}/10"
         if hints: ctx += "\n\n## Hints\n" + "\n".join(f"{i}. {h}" for i, h in enumerate(hints, 1))
         if sol: ctx += f"\n\n## Reference Solution\n{sol}"
-        return await self._call(DECOMPOSE_PROMPT, ctx, Decomposition)
+
+        # Try strict first, fall back to lenient
+        result = await self._call(DECOMPOSE_PROMPT, ctx, DecompositionStrict)
+        if result:
+            return result, []
+
+        result = await self._call(DECOMPOSE_PROMPT, ctx, DecompositionLenient)
+        warnings = ["used_lenient_schema"] if result else []
+        return result, warnings
 
     async def expand(self, q: str, sol: str = None):
         ctx = f"## Problem\n{q}" + (f"\n\n## Solution Approach\n{sol}" if sol else "")
@@ -214,46 +234,86 @@ class Decomposer:
     async def verify(self, q: str, ans: str):
         return await self._call(VERIFY_PROMPT, f"## Question\n{q}\n\n## Proposed Answer\n{ans}", Verification, temp=0.2)
 
+    def _validate_quality(self, result: Dict) -> List[str]:
+        """Check quality issues and return warnings (don't fail)."""
+        warnings = []
+        subs = result.get("sub_questions", [])
+
+        # Check self-contained
+        for i, sq in enumerate(subs):
+            q = sq.get("question", "").lower()
+            if any(b in q for b in ["previous", "above", "earlier", "prior"]):
+                warnings.append(f"sub_q_{i}_not_self_contained")
+
+        # Check ordering
+        diffs = [sq.get("difficulty", 0) for sq in subs]
+        if diffs and diffs != sorted(diffs):
+            warnings.append("sub_questions_not_ordered")
+
+        # Check skills count
+        skills = result.get("skills", [])
+        if len(skills) > 5:
+            warnings.append("too_many_skills")
+        if len(skills) == 0:
+            warnings.append("no_skills")
+
+        return warnings
+
     async def process(self, q: str, sol: str = None, diff: int = None,
                       hints: List[str] = None, breadth: bool = True) -> Dict[str, Any]:
         await self._init()
-        result = {"question": q, "success": False}
+        result = {"question": q, "success": False, "warnings": []}
 
-        decomp = await self.decompose(q, sol, diff, hints)
-        if not decomp:
+        # Decompose with fallback
+        decomp_result = await self.decompose(q, sol, diff, hints)
+        if decomp_result is None or decomp_result[0] is None:
             result["error"] = "decomposition_failed"
             return result
 
+        decomp, warnings = decomp_result
+        result["warnings"].extend(warnings)
         result["difficulty"] = decomp.estimated_difficulty
-        result["skills"] = [s.model_dump() for s in decomp.core_skills]
+        result["skills"] = [s.model_dump() for s in decomp.core_skills] if decomp.core_skills else []
         result["steps"] = decomp.reasoning_steps
 
-        # Process sub-questions with solve+verify
+        # Process sub-questions with solve+verify (keep partial results)
         subs = []
         for sq in decomp.sub_questions:
             sub = {"question": sq.question, "difficulty": sq.difficulty, "skill": sq.target_skill}
-            ans = await self.solve(sq.question)
-            if ans:
-                ver = await self.verify(sq.question, ans.answer)
-                if ver and ver.is_correct:
-                    sub.update(answer=ans.answer, verified=True, confidence=ans.confidence)
-                elif ver and ver.final_answer:
-                    sub.update(answer=ver.final_answer, verified=True, corrected=True)
+            try:
+                ans = await self.solve(sq.question)
+                if ans:
+                    ver = await self.verify(sq.question, ans.answer)
+                    if ver and ver.is_correct:
+                        sub.update(answer=ans.answer, verified=True, confidence=ans.confidence)
+                    elif ver and ver.final_answer:
+                        sub.update(answer=ver.final_answer, verified=True, corrected=True)
+                    else:
+                        sub.update(answer=ans.answer, verified=False,
+                                  critique=ver.critique if ver else "verification_failed")
                 else:
-                    sub.update(answer=ans.answer, verified=False,
-                              critique=ver.critique if ver else "verification_failed")
-            else:
-                sub.update(answer=None, verified=False, error="solve_failed")
+                    sub.update(answer=None, verified=False, error="solve_failed")
+            except Exception as e:
+                sub.update(answer=None, verified=False, error=str(e)[:100])
             subs.append(sub)
         result["sub_questions"] = subs
 
+        # Breadth expansion (don't fail if this fails)
         if breadth:
-            exp = await self.expand(q, sol)
-            if exp:
-                result["breadth"] = {
-                    "core": exp.core_concept,
-                    "variations": [v.model_dump() for v in exp.variations]
-                }
+            try:
+                exp = await self.expand(q, sol)
+                if exp and exp.variations:
+                    result["breadth"] = {
+                        "core": exp.core_concept,
+                        "variations": [v.model_dump() for v in exp.variations]
+                    }
+                else:
+                    result["warnings"].append("breadth_failed")
+            except Exception:
+                result["warnings"].append("breadth_failed")
+
+        # Quality validation (warnings only)
+        result["warnings"].extend(self._validate_quality(result))
 
         result["success"] = True
         return result
