@@ -1,0 +1,727 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+\usepackage{mdframed}
+\usepackage{parskip}
+\usepackage{titlesec}
+
+\geometry{margin=1.1in}
+\hypersetup{colorlinks=true,linkcolor=blue!70!black,citecolor=green!50!black,urlcolor=blue!60!black}
+
+% Theorem environments
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{example}[theorem]{Example}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{intuition}[theorem]{Intuition}
+
+% Custom boxes
+\tcbuselibrary{skins,breakable}
+\newtcolorbox{keyresult}{
+    colback=blue!5!white,
+    colframe=blue!75!black,
+    fonttitle=\bfseries,
+    title=Key Result,
+    breakable
+}
+\newtcolorbox{warning}{
+    colback=red!5!white,
+    colframe=red!75!black,
+    fonttitle=\bfseries,
+    title=Common Misconception,
+    breakable
+}
+\newtcolorbox{takeaway}{
+    colback=green!5!white,
+    colframe=green!60!black,
+    fonttitle=\bfseries,
+    title=Practical Takeaway,
+    breakable
+}
+
+% Math commands
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\calH}{\mathcal{H}}
+\newcommand{\Adv}{\mathrm{Adv}}
+\newcommand{\Var}{\mathrm{Var}}
+
+% Section formatting
+\titleformat{\section}{\Large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.5em}{}
+
+\title{\textbf{Information Bandwidth of Reinforcement Learning}\\[0.5em]\Large Lecture Notes on Why RL is Data-Inefficient\\and What We Can Do About It}
+\author{Synthesized from Ord~\cite{ord2025}, Li~\cite{li2025info}, Shao et al.~\cite{deepseekmath}, and DAPO/GRPO literature}
+\date{}
+
+\begin{document}
+\maketitle
+
+\vspace{1em}
+\begin{abstract}
+These lecture notes provide a treatment of the information-theoretic foundations of reinforcement learning for large language models. We derive the ``1 bit per gradient step'' bound from first principles, then systematically analyze how this bound changes under realistic training configurations. The analysis draws primarily from Ord's scaling analysis~\cite{ord2025} and Li's information-theoretic framework~\cite{li2025info}, with empirical grounding from DeepSeek-R1~\cite{deepseekr1} and recent algorithmic developments including GRPO~\cite{deepseekmath}, DAPO~\cite{dapo2025}, and GRESO~\cite{greso2025}.
+\end{abstract}
+
+\vspace{2em}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Motivation: The Efficiency Puzzle}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Consider the following empirical contrast that motivates everything that follows.
+
+\textbf{Pre-training a frontier LLM} requires approximately $10^{13}$ tokens (10--15 trillion). Each token provides a supervision signal---the correct next token---and the model learns from every single one.
+
+\textbf{RL fine-tuning}, as exemplified by DeepSeek-R1~\cite{deepseekr1}, uses approximately 4 million rollouts over $\sim$8,000 gradient steps, with each rollout generating an average of $\sim$4,000 tokens. That is roughly 16 billion tokens \emph{generated}---but how much \emph{learning signal} do we extract?
+
+The puzzle: DeepSeek-R1's RL phase produces substantial improvements in reasoning ability, yet it processes orders of magnitude fewer ``bits of feedback'' than pre-training. How do we reconcile this?
+
+\begin{intuition}
+The resolution lies in distinguishing between \textbf{tokens generated} and \textbf{bits of information about the optimal policy}. Pre-training provides $\sim$3 bits per token (see Section~\ref{sec:comparison}). RL with binary rewards provides $\sim$1 bit per \emph{episode} of thousands of tokens. The information density differs by a factor of $10^3$ to $10^6$.
+\end{intuition}
+
+Ord~\cite{ord2025} articulates this succinctly: ``Pre-training via next-token-prediction provides the model with a token worth of information for every token produced during training. In contrast, RL on machine-checkable tasks requires a long chain of thousands or millions of tokens before revealing to the model a single bit of information.''
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{The Scalar Advantage Bottleneck}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Setting Up the Problem}
+
+Consider a language model $\pi_\theta$ that generates a response (trajectory) $\tau = (a_1, a_2, \ldots, a_T)$ given a prompt. We want to optimize $\theta$ to maximize expected reward:
+\[
+J(\theta) = \E_{\tau \sim \pi_\theta}[R(\tau)]
+\]
+
+The policy gradient theorem gives:
+\[
+\nabla_\theta J(\theta) = \E_{\tau \sim \pi_\theta}\left[\nabla_\theta \log \pi_\theta(\tau) \cdot R(\tau)\right]
+\]
+
+In practice, we use a baseline $b$ to reduce variance, giving the REINFORCE estimator:
+\[
+g = \nabla_\theta \log \pi_\theta(\tau) \cdot \underbrace{(R(\tau) - b)}_{\text{Advantage } A}
+\]
+
+\subsection{The Information-Theoretic Decomposition}
+
+Following Li~\cite{li2025info}, we can formalize the information flow in this gradient. The central question is: how much does gradient $g$ tell us about the optimal policy $\pi^*$, given what we already know from training history $\calH$?
+
+The gradient $g$ is the product of two terms:
+\begin{enumerate}
+    \item $\nabla_\theta \log \pi_\theta(\tau)$: Given the training history $\calH$ (which determines $\theta$), this term is \textbf{completely determined by $\tau$}. It depends only on the trajectory and current parameters, not on the reward function $R$.
+
+    \item $A = R(\tau) - b$: This is the \textbf{only channel} through which information about the reward function $R$---and hence about the optimal policy $\pi^*$---enters the gradient.
+\end{enumerate}
+
+\begin{lemma}[Scalar Advantage Bottleneck]
+\label{lem:bottleneck}
+Let $\pi^*$ denote the optimal policy for reward function $R$, and let $\calH$ denote the training history. Then:
+\[
+I(g;\, \pi^* \mid \calH) \leq I(A;\, \pi^* \mid \tau, \calH)
+\]
+where $I(\cdot; \cdot \mid \cdot)$ denotes conditional mutual information.
+\end{lemma}
+
+\begin{proof}
+The gradient $g = f(\tau, A, \theta)$ is a deterministic function of $(\tau, A, \theta)$, where $\theta$ is determined by $\calH$. By the data processing inequality:
+\[
+I(g;\, \pi^* \mid \calH) \leq I((\tau, A);\, \pi^* \mid \calH)
+\]
+The trajectory $\tau$ is sampled from $\pi_\theta$ without knowledge of $R$ (given $\calH$), so $\tau \perp \pi^* \mid \calH$. By the chain rule for mutual information:
+\[
+I((\tau, A);\, \pi^* \mid \calH) = I(\tau;\, \pi^* \mid \calH) + I(A;\, \pi^* \mid \tau, \calH) = 0 + I(A;\, \pi^* \mid \tau, \calH)
+\]
+\end{proof}
+
+\subsection{The 1-Bit Bound}
+
+The advantage $A$ is a scalar random variable. Its mutual information with $\pi^*$ is bounded by its entropy:
+\[
+I(A;\, \pi^* \mid \tau, \calH) \leq H(A \mid \tau, \calH) \leq \log_2(B)
+\]
+where $B$ is the number of distinct values $A$ can take.
+
+\begin{keyresult}
+For binary pass/fail rewards ($R \in \{0, 1\}$), we have $B = 2$, giving:
+\[
+I(g;\, \pi^*) \leq 1 \text{ bit per gradient step}
+\]
+This is an information-theoretic ceiling, not an empirical approximation.
+\end{keyresult}
+
+\subsection{What This Bound Means}
+
+\begin{example}[Math Problem RL]
+Consider training a model to solve math problems. We generate one solution, check correctness, and compute a gradient.
+
+The gradient $g \in \R^d$ may have billions of components. But despite this high dimensionality, its \emph{information content about the optimal policy} is at most 1 bit.
+
+The structure of $g$ has the form $g = \nabla_\theta \log \pi_\theta(\tau) \cdot A$ where $A \in \{-b, 1-b\}$. The high-dimensional structure comes from $\nabla_\theta \log \pi_\theta(\tau)$, which is determined by the trajectory the model already generated. The reward contributes exactly one bit: ``reinforce this trajectory'' or ``suppress this trajectory.''
+\end{example}
+
+\begin{warning}
+A common confusion: ``the gradient has billions of dimensions, so it must carry more than 1 bit.'' This conflates \emph{dimensionality} with \emph{information content}. A billion-dimensional vector constrained to equal either $+v$ or $-v$ for some fixed $v$ carries exactly 1 bit of information. The dimension count is irrelevant; what matters is the entropy of the distribution over possible gradient values.
+\end{warning}
+
+\begin{remark}[Nuance on ``1 bit'']
+The bound $I(g; \pi^*) \leq 1$ bit is a bound on mutual information with the \emph{optimal policy}. This is distinct from:
+\begin{itemize}
+    \item The information needed to \emph{represent} the gradient (which could be billions of bits)
+    \item The information the gradient carries about the \emph{trajectory} (which is much higher)
+    \item The practical utility of the gradient for improving the policy
+\end{itemize}
+The bound captures specifically how much we learn about \emph{what the optimal policy looks like} from a single reward observation.
+\end{remark}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{When the Bound is Tight (and When It's Not)}
+%═══════════════════════════════════════════════════════════════════════════════
+
+The 1-bit bound is tight under specific conditions. Understanding when it applies---and when it does not---is essential.
+
+\subsection{Conditions for Tightness}
+
+The bound is tight when:
+\begin{enumerate}
+    \item \textbf{Single rollout}: One trajectory per gradient step
+    \item \textbf{Terminal reward}: The entire trajectory receives one scalar score
+    \item \textbf{Binary reward}: Pass/fail with no partial credit
+    \item \textbf{Scalar advantage}: The reward collapses to a single number per trajectory
+\end{enumerate}
+
+Li~\cite{li2025info} notes: ``With terminal rewards only, scalar and per-timestep advantage formulations have the same information ceiling---both $O(1)$ bits. This explains why simple scalar-advantage methods dominate in LLM fine-tuning: the added complexity of per-timestep formulations provides no information-theoretic benefit when rewards are sparse.''
+
+\subsection{Factors That Increase Information}
+
+Each condition above can be relaxed:
+
+\begin{center}
+\begin{tabular}{@{}p{4cm}p{4cm}p{4cm}@{}}
+\toprule
+\textbf{Relaxation} & \textbf{Information Gain} & \textbf{Cost} \\
+\midrule
+$B$-level rewards & $\log_2(B)$ bits/advantage & Reward engineering \\
+$K$ rollouts per prompt & $\times K$ multiplier & $K\times$ compute \\
+$X$ prompts per batch & $\times X$ multiplier & Memory \\
+Per-timestep rewards & $\times T$ multiplier & Dense reward design \\
+$M$ reward dimensions & $+M$ additive & Multi-objective setup \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Non-Binary Rewards: The $\log_2(B)$ Factor}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{The Setup}
+
+Instead of binary $R \in \{0, 1\}$, suppose rewards take $B$ distinguishable values:
+\begin{itemize}
+    \item \textbf{5-level rubric}: $R \in \{0, 0.25, 0.5, 0.75, 1\}$, so $B = 5$
+    \item \textbf{Code with 10 unit tests}: $R \in \{0, 0.1, 0.2, \ldots, 1\}$, so $B = 11$
+    \item \textbf{8-bit quantized}: $R \in \{0, 1, \ldots, 255\}/255$, so $B = 256$
+\end{itemize}
+
+\subsection{The Information Bound}
+
+The analysis proceeds identically:
+\[
+I(g;\, \pi^*) \leq \log_2(B) \text{ bits}
+\]
+
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Reward Type} & $B$ & \textbf{Bits/rollout} & \textbf{vs.\ Binary} \\
+\midrule
+Binary pass/fail & 2 & 1.00 & 1.0$\times$ \\
+Ternary $\{-1, 0, +1\}$ & 3 & 1.58 & 1.6$\times$ \\
+5-level rubric & 5 & 2.32 & 2.3$\times$ \\
+10-level rubric & 10 & 3.32 & 3.3$\times$ \\
+Code (10 tests) & 11 & 3.46 & 3.5$\times$ \\
+100-level & 100 & 6.64 & 6.6$\times$ \\
+8-bit quantized & 256 & 8.00 & 8.0$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{takeaway}
+Moving from binary to a 5-level rubric more than doubles information bandwidth at zero additional compute cost. Reward shaping is not just about reward quality---it directly increases information throughput.
+\end{takeaway}
+
+Ord~\cite{ord2025} observes: ``There may be productive ways of giving the model more than 1 bit of information per episode. An obvious approach, where applicable, is to score partial success with intermediate reward levels. For example, a switch to a 32-bit floating point reward would give a theoretical ceiling of 32 bits. Though even when there are good ways to score partial success, it isn't clear that a model could usefully extract more than a few useful bits of information from this.''
+
+\subsection{The Entropy Constraint}
+
+The bound $\log_2(B)$ assumes uniform distribution over the $B$ possible advantage values. In practice:
+\[
+I(A;\, \pi^*) \leq H(A) \leq \log_2(B)
+\]
+with equality only when $A$ is uniformly distributed.
+
+\begin{example}[Near-Convergence Behavior]
+Consider a model that succeeds on a problem 99\% of the time. The entropy is:
+\[
+H(A) = H(\text{Bernoulli}(0.99)) = -0.99 \log_2(0.99) - 0.01 \log_2(0.01) \approx 0.08 \text{ bits}
+\]
+The model has nearly saturated this problem and extracts almost no information from it.
+\end{example}
+
+\begin{keyresult}
+Information is maximized when the model succeeds with probability $p \approx 0.5$ (for binary rewards) or when rewards are uniformly distributed (for multi-level). This provides an information-theoretic justification for curriculum learning: training on problems at the frontier of the model's ability maximizes bits per rollout.
+\end{keyresult}
+
+\subsection{Continuous Rewards and Practical Limits}
+
+In principle, a float16 reward has $2^{16}$ distinguishable values. This overstates useful information for two reasons:
+
+\textbf{Gradient noise floor.} Stochastic training means the model cannot distinguish reward differences smaller than the effective gradient noise. If gradient noise has standard deviation $\sigma_g$ and reward-to-gradient sensitivity is $\partial g / \partial R$, the effective resolution is:
+\[
+\Delta R_{\text{min}} \sim \frac{\sigma_g}{|\partial g / \partial R|}
+\]
+
+\textbf{Reward noise.} If the reward is a noisy estimate of ground truth, Shannon's channel capacity applies. For signal power $P$ and noise power $\sigma^2$:
+\[
+C = \frac{1}{2} \log_2\left(1 + \frac{P}{\sigma^2}\right) \text{ bits}
+\]
+
+Empirically, effective information from continuous rewards appears to be 3--8 bits, not 16 or 32.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Multiple Rollouts: The GRPO Regime}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{The Setup}
+
+Modern RL for LLMs uses \textbf{Group Relative Policy Optimization (GRPO)}~\cite{deepseekmath}:
+\begin{itemize}
+    \item Sample $X$ prompts
+    \item For each prompt $i$, generate $K$ rollouts $\{\tau_{i,1}, \ldots, \tau_{i,K}\}$
+    \item Compute rewards $\{r_{i,1}, \ldots, r_{i,K}\}$
+    \item Compute advantages via z-normalization within each group:
+    \[
+    A_{i,j} = \frac{r_{i,j} - \mu_i}{\sigma_i + \epsilon}, \quad \mu_i = \frac{1}{K}\sum_j r_{i,j}, \quad \sigma_i^2 = \frac{1}{K}\sum_j (r_{i,j} - \mu_i)^2
+    \]
+    \item Aggregate gradient:
+    \[
+    g = \sum_{i=1}^{X} \sum_{j=1}^{K} \nabla_\theta \log \pi_\theta(\tau_{i,j}) \cdot A_{i,j}
+    \]
+\end{itemize}
+
+GRPO eliminates the need for a separate critic model by using group-level statistics as baselines. This simplification, introduced in DeepSeekMath~\cite{deepseekmath}, has become the dominant approach for RL fine-tuning of LLMs.
+
+\subsection{Information Analysis}
+
+GRPO uses \textbf{per-rollout advantages}: each rollout $j$ gets its own $A_{i,j}$ multiplied by its own gradient direction.
+
+For binary rewards with success probability $p_i$ on prompt $i$:
+
+\begin{lemma}[Per-Prompt Information]
+The information from prompt $i$ with $K$ rollouts is bounded by:
+\[
+I(g_i;\, \pi^* \mid \calH) \leq K \cdot H(p_i)
+\]
+where $H(p) = -p \log_2 p - (1-p) \log_2(1-p)$ is binary entropy.
+\end{lemma}
+
+\begin{proof}
+Each of the $K$ rollouts provides an independent Bernoulli$(p_i)$ outcome. The sufficient statistic is not just the success count (which would give $\log_2(K+1)$ bits) but the \emph{identity of which rollouts succeeded}. Since different rollouts take different trajectories, knowing which specific trajectory succeeded provides credit-assignment information. The total is $K$ independent binary random variables with entropy $H(p_i)$ each.
+\end{proof}
+
+Summing over the batch:
+
+\begin{keyresult}
+For a batch of $X$ prompts with $K$ rollouts each, all at optimal difficulty ($p_i = 0.5$):
+\[
+\boxed{I_{\max} = X \cdot K \text{ bits per gradient step}}
+\]
+\end{keyresult}
+
+\subsection{DeepSeek-R1 Configuration}
+
+According to the DeepSeek-R1 technical report~\cite{deepseekr1}, the RL training used:
+\begin{itemize}
+    \item 32 prompts per training step
+    \item 16 rollouts per prompt
+    \item Maximum length 32,768 tokens; average length $\sim$4,000 tokens
+    \item Approximately 8,000 gradient steps total
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Configuration} & $X$ & $K$ & \textbf{Bits/step} \\
+\midrule
+Minimal GRPO & 8 & 8 & 64 \\
+DeepSeek-R1 & 32 & 16 & 512 \\
+Typical GRPO & 128 & 16 & 2,048 \\
+Large-scale & 512 & 32 & 16,384 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{example}[DeepSeek-R1 Information Budget]
+DeepSeek-R1 trained for approximately 8,000 gradient steps with 512 rollouts per step. Total information budget:
+\[
+8{,}000 \times 512 = 4.1 \text{ million bits} \approx 500 \text{ KB}
+\]
+
+For comparison, a rank-64 LoRA adapter on a 7B model with target modules has roughly 10M trainable parameters at 16 bits each $\approx$ 160 million bits of capacity. The RL information budget (4.1M bits) is much smaller, consistent with the observation that RL fine-tuning makes relatively small adjustments to the pre-trained model.
+\end{example}
+
+\subsection{The Degenerate Group Problem}
+
+Not all groups provide information.
+
+\begin{definition}[Degenerate Group]
+A group is \textbf{degenerate} if all $K$ rollouts receive the same reward (all pass or all fail).
+\end{definition}
+
+For a degenerate group:
+\begin{itemize}
+    \item $\mu_i = r_{i,j}$ for all $j$, hence $\sigma_i = 0$
+    \item $A_{i,j} = 0$ for all $j$ (with $\epsilon$-stabilization, the advantages are negligible)
+    \item Gradient contribution $g_i \approx 0$
+    \item \textbf{Information: exactly 0 bits}
+\end{itemize}
+
+The probability of degeneracy for a prompt with success probability $p$:
+\[
+P(\text{degenerate}) = p^K + (1-p)^K
+\]
+
+\begin{center}
+\begin{tabular}{@{}cccc@{}}
+\toprule
+$p$ & $K=4$ & $K=16$ & $K=64$ \\
+\midrule
+0.5 & 12.5\% & 0.003\% & $\approx 0$ \\
+0.7 & 26.5\% & 3.3\% & 0.001\% \\
+0.9 & 68.6\% & 18.5\% & 0.1\% \\
+0.95 & 81.9\% & 44.0\% & 3.7\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{takeaway}
+At $p = 0.9$ with $K = 16$, nearly 1 in 5 groups contribute zero information---wasted compute. GRESO~\cite{greso2025} demonstrated that predicting and skipping low-value prompts before rollout achieves up to $2.4\times$ rollout speedup and $2.0\times$ overall training speedup with no accuracy loss. DAPO~\cite{dapo2025} introduced Dynamic Sampling to filter zero-variance prompts and refill batches with informative data.
+\end{takeaway}
+
+\subsection{Diminishing Returns from Larger $K$}
+
+Increasing $K$ has diminishing returns:
+\begin{enumerate}
+    \item Marginal information per additional rollout decreases (sampling from the same distribution)
+    \item Memory constraints mean larger $K$ implies fewer prompts $X$ per batch
+    \item Wu et al.~\cite{ittakestwo2025} showed that 2-GRPO retains 98.1\% of the performance of 16-GRPO while requiring only 12.5\% of the rollouts and 21\% of training time
+\end{enumerate}
+
+The information-optimal strategy is often: \textbf{more prompts at moderate $K$} rather than fewer prompts at large $K$.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Mixed-Domain Batches and Vector Rewards}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Heterogeneous Reward Functions}
+
+Real training batches mix prompts from different domains:
+\begin{itemize}
+    \item \textbf{Math}: Binary correctness, $B = 2$
+    \item \textbf{Code}: Fraction of tests passed, $B = 11$ (for 10 tests)
+    \item \textbf{Instruction Following}: Multi-criterion rubric, $B$ up to 32
+    \item \textbf{Safety}: Ternary (safe/borderline/unsafe), $B = 3$
+\end{itemize}
+
+\subsection{Information by Domain}
+
+Each domain contributes:
+\[
+I_{\text{total}} = \sum_{d \in \text{domains}} \sum_{i \in d} K \cdot H(r_i^{(d)})
+\]
+
+The per-rollout information density varies:
+
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Domain} & $B$ & \textbf{Bits/rollout (max)} & \textbf{vs.\ Math} \\
+\midrule
+Math (binary) & 2 & 1.00 & 1.0$\times$ \\
+Safety (ternary) & 3 & 1.58 & 1.6$\times$ \\
+Code (10 tests) & 11 & 3.46 & 3.5$\times$ \\
+IF (5-criterion) & 32 & 5.00 & 5.0$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{takeaway}
+A batch that is 40\% math and 30\% code by prompt count is not 40\%/30\% by information. Code rollouts carry $3.5\times$ more bits per rollout. If information is the bottleneck, high-$B$ domains should be oversampled relative to their intrinsic importance.
+\end{takeaway}
+
+\subsection{Vector Rewards: Scalar Collapse Destroys Information}
+
+Modern systems often compute multiple reward signals:
+\[
+\mathbf{r}_j = (r_j^{\text{correct}}, r_j^{\text{format}}, r_j^{\text{length}}, r_j^{\text{style}})
+\]
+
+\textbf{Problematic}: Collapse to scalar before computing advantage:
+\[
+r_j = \sum_m w_m r_j^{(m)} \implies \text{Information loss}
+\]
+
+The weighted sum is many-to-one. Different reward vectors can produce the same scalar:
+\[
+H\left(\sum_m w_m r^{(m)}\right) \leq \min\left(\log_2(B_{\text{combined}}), \sum_m H(r^{(m)})\right)
+\]
+
+\textbf{Better}: Compute per-component advantages:
+\[
+g_j = \sum_m \nabla_\theta \log \pi_\theta(\tau_j) \cdot A_j^{(m)}
+\]
+
+This preserves:
+\[
+I \leq \sum_m H(r^{(m)})
+\]
+
+\begin{example}[Information Destruction]
+With $M = 10$ independent binary reward signals:
+\begin{itemize}
+    \item \textbf{Vector approach}: Up to 10 bits per rollout
+    \item \textbf{Scalar collapse}: Sum takes values in $\{0, 1, \ldots, 10\}$, giving at most $\log_2(11) = 3.46$ bits
+    \item \textbf{Information destroyed}: $10 - 3.46 = 6.54$ bits, or 65\% of the signal
+\end{itemize}
+\end{example}
+
+\subsection{Gradient Interference}
+
+Even with preserved information, gradient directions can conflict. If math rewards push $\theta$ toward $d_1$ and code rewards push toward $d_2$ with $d_1 \cdot d_2 < 0$, the net gradient partially cancels. Information was \emph{present} but not fully \emph{utilized}.
+
+This is an optimization limit, not an information-theoretic one. Manifestations include training instability with heterogeneous batches and potential benefits from per-domain gradient normalization or domain-specific adapters.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{The Unified Formula and Comparison to Pre-Training}
+\label{sec:comparison}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{The Master Equation}
+
+Combining all factors:
+
+\begin{keyresult}
+\[
+\boxed{I_{\text{step}} \leq X \cdot K \cdot M \cdot \log_2(B) \text{ bits}}
+\]
+where:
+\begin{itemize}
+    \item $X$ = prompts per batch
+    \item $K$ = rollouts per prompt
+    \item $M$ = independent reward dimensions
+    \item $B$ = reward cardinality per dimension
+\end{itemize}
+\end{keyresult}
+
+This ceiling assumes independence. Practical factors that reduce it:
+\begin{enumerate}
+    \item \textbf{Non-optimal difficulty}: Prompts with $p \neq 0.5$ contribute $< \log_2(B)$ bits
+    \item \textbf{Degenerate groups}: Same-reward groups contribute 0 bits
+    \item \textbf{Reward correlation}: Correlated dimensions don't add full bits
+    \item \textbf{Gradient interference}: Conflicting objectives partially cancel
+    \item \textbf{Optimizer inefficiency}: SGD/Adam don't optimally extract information
+    \item \textbf{Representational limits}: Model may lack capacity to use the signal
+\end{enumerate}
+
+\subsection{The Pre-Training Comparison}
+
+Ord~\cite{ord2025} provides a calibration for pre-training information density:
+
+\begin{quote}
+``GPT-4 has about $10^{12}$ parameters (so about $3 \times 10^{13}$ bits [at 32-bit precision]) trained on about $10^{13}$ tokens of training data, which comes to about 3 bits of model capacity per token of training data. I'm actually surprised by how close this is, as 3 bits of weights per token is the capacity that would be necessary if it was optimally learning all bits of information in the training signal.''
+\end{quote}
+
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Training Paradigm} & \textbf{Bits per Token} & \textbf{Tokens per Signal} \\
+\midrule
+Pre-training (next-token prediction) & $\sim$3 & 1 \\
+Distillation (teacher logits) & $\sim$6--10 & 1 \\
+SFT (instruction tuning) & $\sim$2--3 & 1 \\
+RL with binary terminal reward & $\sim$1 per episode & $T$ (thousands) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For $T = 4{,}000$ tokens per episode (DeepSeek-R1 average), RL is approximately $12{,}000\times$ less information-dense than pre-training per token generated.
+
+Even with GRPO ($K = 16$) and 5-level rewards ($B = 5$):
+\[
+\text{RL bits/token} = \frac{K \cdot \log_2(B)}{T} = \frac{16 \cdot 2.32}{4{,}000} \approx 0.009
+\]
+
+Still $\sim$300$\times$ less dense than pre-training.
+
+\subsection{Reconciling RL's Effectiveness}
+
+Given this massive inefficiency, why does RL work?
+
+\begin{keyresult}
+RL bits are \textbf{targeted bits}. They directly optimize the objective we care about (task success, human preference) rather than compressing arbitrary text.
+
+Pre-training learns ``what text looks like.'' RL learns ``what good solutions look like.'' The latter is a much more constrained target.
+\end{keyresult}
+
+Ord~\cite{ord2025} offers this resolution: ``My best guess is that it comes down to the breadth of what the systems are learning. RL is great for learning a narrow task in great depth and bursting through the human-range of abilities without even a kink in the learning curve.''
+
+Additional factors:
+\begin{itemize}
+    \item The model already has most relevant ``knowledge'' from pre-training
+    \item RL is fine-tuning, not learning from scratch
+    \item Low-rank adapters suffice because the information budget is inherently limited
+\end{itemize}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Practical Implications}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Reward Engineering}
+
+\begin{takeaway}
+Increasing reward cardinality from $B$ to $\alpha B$ gives:
+\[
+\Delta I = K \cdot \log_2(\alpha) \text{ bits/prompt}
+\]
+at zero additional compute cost. Increasing rollouts from $K$ to $\alpha K$ gives similar information gain but costs $\alpha\times$ compute.
+
+\textbf{Implication}: Invest in richer rewards before scaling rollouts.
+\end{takeaway}
+
+\subsection{Curriculum Learning}
+
+\begin{takeaway}
+Information per prompt is maximized at $p \approx 0.5$:
+\begin{itemize}
+    \item Too easy ($p \to 1$): Low entropy, degenerate groups
+    \item Too hard ($p \to 0$): Low entropy, degenerate groups
+    \item Optimal ($p \approx 0.5$): Maximum entropy, minimum degeneracy
+\end{itemize}
+Train on problems at the frontier of the model's current ability.
+\end{takeaway}
+
+\subsection{Batch Composition}
+
+\begin{takeaway}
+Allocate compute proportionally to information rate:
+\[
+\text{Optimal fraction for domain } d \propto \frac{\log_2(B_d) \cdot H(p_d)}{T_d}
+\]
+Domains with rich rewards and short episodes should be oversampled.
+\end{takeaway}
+
+\subsection{Dynamic Sampling}
+
+\begin{takeaway}
+Skip zero-information groups (DAPO~\cite{dapo2025}/GRESO~\cite{greso2025} approach):
+\begin{itemize}
+    \item Filter prompts where all $K$ rollouts received identical rewards
+    \item Refill batches with informative prompts
+    \item Achieves $2\times$--$2.4\times$ speedup with no accuracy loss
+\end{itemize}
+\end{takeaway}
+
+\subsection{Rollout Count}
+
+\begin{takeaway}
+The ``It Takes Two''~\cite{ittakestwo2025} result suggests 2-GRPO retains 98\% of 16-GRPO performance at 12.5\% of rollout cost. Consider whether high $K$ is necessary for your application.
+\end{takeaway}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Summary}
+%═══════════════════════════════════════════════════════════════════════════════
+
+The ``1 bit per step'' claim is \textbf{correct} under specific conditions (single rollout, binary terminal reward, scalar advantage) and \textbf{incomplete} as a general characterization.
+
+The actual information bound is:
+\[
+I_{\text{step}} \leq X \cdot K \cdot M \cdot \log_2(B)
+\]
+
+Key levers to increase throughput:
+\begin{enumerate}
+    \item \textbf{Richer rewards} ($\uparrow B$): Zero compute cost, invest here first
+    \item \textbf{More rollouts} ($\uparrow K$): Linear cost, diminishing returns past $K \approx 2$--8
+    \item \textbf{More prompts} ($\uparrow X$): Memory-limited, high leverage if feasible
+    \item \textbf{Vector rewards} ($\uparrow M$): Preserve structure, avoid scalar collapse
+    \item \textbf{Curriculum}: Maintain $p \approx 0.5$ to maximize entropy
+    \item \textbf{Dynamic sampling}: Skip degenerate groups
+\end{enumerate}
+
+The $10^3$--$10^6\times$ information density gap with pre-training explains why:
+\begin{itemize}
+    \item RL requires far fewer tokens than pre-training
+    \item Low-rank adapters suffice for RL fine-tuning
+    \item RL builds on pre-trained representations rather than learning from scratch
+\end{itemize}
+
+The bits RL provides are targeted at the objective we care about, explaining dramatic task improvements despite their scarcity.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section*{Limitations and Open Questions}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\begin{enumerate}
+    \item \textbf{Mutual information bounds are not achievability results.} The bound $I(g; \pi^*) \leq 1$ bit tells us the ceiling; it does not guarantee we can extract that bit efficiently.
+
+    \item \textbf{The optimal policy $\pi^*$ is not a fixed target.} In practice, we estimate the reward function (via a learned reward model), introducing additional uncertainty not captured in this analysis.
+
+    \item \textbf{Multi-step learning effects.} Information accumulates across gradient steps. The interaction between steps---how early learning affects what later steps can learn---is not captured by per-step bounds.
+
+    \item \textbf{Representation learning.} RL may modify internal representations in ways that unlock future learning, providing value beyond the immediate gradient step.
+\end{enumerate}
+
+\begin{thebibliography}{99}
+
+\bibitem{ord2025}
+T.~Ord, ``The Extreme Inefficiency of RL for Frontier Models,'' 2025.
+\url{https://www.tobyord.com/writing/inefficiency-of-reinforcement-learning}
+
+\bibitem{li2025info}
+Y.~Li, ``Information Bandwidth in Reinforcement Learning,'' 2025.
+\url{https://richardli.xyz/post/information-bandwidth-rl/}
+
+\bibitem{deepseekr1}
+DeepSeek-AI, ``DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning,'' arXiv:2501.12948, 2025.
+
+\bibitem{deepseekmath}
+Z.~Shao et al., ``DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models,'' arXiv:2402.03300, 2024.
+
+\bibitem{dapo2025}
+Q.~Yu et al., ``DAPO: An Open-Source LLM Reinforcement Learning System at Scale,'' arXiv:2503.14476, 2025.
+
+\bibitem{greso2025}
+Infini-AI-Lab, ``GRESO: GRPO with Efficient Selective Rollout,'' 2025.
+\url{https://github.com/Infini-AI-Lab/GRESO}
+
+\bibitem{ittakestwo2025}
+Y.~Wu et al., ``It Takes Two: Your GRPO Is Secretly DPO,'' arXiv:2510.00977, 2025.
+
+\end{thebibliography}
+
+\end{document}
