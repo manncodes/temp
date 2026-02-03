@@ -66,7 +66,7 @@
 \titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.5em}{}
 
 \title{\textbf{Information Bandwidth of Reinforcement Learning}\\[0.5em]\Large Lecture Notes on Why RL is Data-Inefficient\\and What We Can Do About It}
-\author{Synthesized from Ord~\cite{ord2025}, Li~\cite{li2025info}, Shao et al.~\cite{deepseekmath}, and DAPO/GRPO literature}
+\author{Synthesized from Ord~\cite{ord2025}, Li~\cite{li2025info}, Shao et al.~\cite{deepseekmath},\\ScaleRL~\cite{scalerl2025}, IsoCompute~\cite{isocompute2025}, and DAPO/GRPO literature}
 \date{}
 
 \begin{document}
@@ -74,7 +74,7 @@
 
 \vspace{1em}
 \begin{abstract}
-These lecture notes provide a treatment of the information-theoretic foundations of reinforcement learning for large language models. We derive the ``1 bit per gradient step'' bound from first principles, then systematically analyze how this bound changes under realistic training configurations. The analysis draws primarily from Ord's scaling analysis~\cite{ord2025} and Li's information-theoretic framework~\cite{li2025info}, with empirical grounding from DeepSeek-R1~\cite{deepseekr1} and recent algorithmic developments including GRPO~\cite{deepseekmath}, DAPO~\cite{dapo2025}, and GRESO~\cite{greso2025}.
+These lecture notes provide a treatment of the information-theoretic foundations of reinforcement learning for large language models. We derive the ``1 bit per gradient step'' bound from first principles, then systematically analyze how this bound changes under realistic training configurations. The analysis draws from Ord's scaling analysis~\cite{ord2025} and Li's information-theoretic framework~\cite{li2025info}, with empirical grounding from DeepSeek-R1~\cite{deepseekr1}, GRPO~\cite{deepseekmath}, DAPO~\cite{dapo2025}, and GRESO~\cite{greso2025}. We conclude with recent compute-optimal scaling results from ScaleRL~\cite{scalerl2025} and IsoCompute~\cite{isocompute2025}, which validate these theoretical principles at the 400,000 GPU-hour scale.
 \end{abstract}
 
 \vspace{2em}
@@ -653,6 +653,98 @@ The ``It Takes Two''~\cite{ittakestwo2025} result suggests 2-GRPO retains 98\% o
 \end{takeaway}
 
 %═══════════════════════════════════════════════════════════════════════════════
+\section{Compute-Optimal Scaling: From Theory to Practice}
+%═══════════════════════════════════════════════════════════════════════════════
+
+The information-theoretic bounds derived above tell us the \emph{ceiling} on learning per gradient step. Recent large-scale empirical work has validated these principles and extended them into practical scaling laws.
+
+\subsection{The ScaleRL Framework}
+
+Prasad et al.~\cite{scalerl2025} conducted a systematic study of RL scaling using over 400,000 GPU-hours. Their key finding: \textbf{RL follows sigmoid (not power-law) scaling}.
+
+Performance as a function of log-compute follows an S-curve with three phases:
+\begin{enumerate}
+    \item \textbf{Slow start}: Model learns basic task structure; progress is gradual
+    \item \textbf{Rapid improvement}: Performance increases sharply
+    \item \textbf{Saturation}: Model approaches an asymptote; additional compute yields diminishing returns
+\end{enumerate}
+
+This sigmoid behavior is consistent with our information-theoretic analysis: as the model improves, $p_i \to 1$ for training prompts, entropy decreases, and bits per rollout diminish---exactly the saturation effect predicted by the entropy constraint in Section 4.
+
+\subsection{What Affects the Asymptote vs.\ Efficiency}
+
+A critical insight from the ScaleRL study: most algorithmic choices affect \emph{when} you reach the performance ceiling, not \emph{what} that ceiling is.
+
+\begin{center}
+\begin{tabular}{@{}p{5cm}p{3cm}p{3cm}@{}}
+\toprule
+\textbf{Design Choice} & \textbf{Asymptote} & \textbf{Efficiency} \\
+\midrule
+Base model quality & $\checkmark$ Changes & --- \\
+Reward function design & $\checkmark$ Changes & $\checkmark$ Changes \\
+Loss aggregation method & Minimal effect & $\checkmark$ Changes \\
+Batch normalization & Minimal effect & $\checkmark$ Changes \\
+Curriculum strategy & Minimal effect & $\checkmark$ Changes \\
+Zero-variance filtering & Minimal effect & $\checkmark$ Changes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This explains why information-theoretic improvements (richer rewards, curriculum learning, filtering degenerate groups) primarily accelerate training without changing the final outcome---they increase \emph{bits per FLOP}, not the total bits needed.
+
+\subsection{The IsoCompute Allocation Problem}
+
+The IsoCompute Playbook~\cite{isocompute2025} addresses a fundamental question: given a fixed compute budget $C$, how should we split it between \textbf{sampling} (generating rollouts) and \textbf{training} (gradient updates)?
+
+In on-policy RL, this tradeoff is non-trivial:
+\begin{itemize}
+    \item More sampling $\Rightarrow$ more diverse trajectories, but less optimization per trajectory
+    \item More training $\Rightarrow$ better exploitation of existing data, but risk of overfitting to stale rollouts
+\end{itemize}
+
+Key findings:
+\begin{itemize}
+    \item Clean scaling laws emerge only with \textbf{low updates-to-data ratio} (limited off-policy reuse)
+    \item Optimal allocation depends on the base model and prompt distribution
+    \item Predictable hyperparameter rules emerge as functions of sampling compute
+\end{itemize}
+
+\subsection{The ScaleRL Recipe}
+
+Combining information-theoretic principles with empirical validation, the ScaleRL recipe~\cite{scalerl2025} achieves state-of-the-art compute efficiency:
+
+\begin{enumerate}
+    \item \textbf{Asynchronous PipelineRL}: Continuous batching + in-flight updates ($4\times$ throughput)
+    \item \textbf{CISPO loss}: Stabilizes optimization for large-scale runs
+    \item \textbf{Prompt-level averaging + batch normalization}: Reduces gradient variance
+    \item \textbf{FP32 precision at logits}: Prevents numerical instability
+    \item \textbf{Zero-variance filtering}: Skips degenerate groups (validates DAPO/GRESO)
+    \item \textbf{Adaptive curriculum}: Removes too-easy prompts as training progresses
+\end{enumerate}
+
+\begin{keyresult}
+The ScaleRL recipe enables \textbf{predictable extrapolation}: small-scale experiments ($\sim$1,000 GPU-hours) accurately predict performance of 100,000 GPU-hour runs. This democratizes RL research by allowing smaller labs to estimate large-run outcomes without running them.
+\end{keyresult}
+
+\subsection{Connecting Theory and Practice}
+
+The table below maps our information-theoretic concepts to their empirical counterparts:
+
+\begin{center}
+\begin{tabular}{@{}p{5.5cm}p{6cm}@{}}
+\toprule
+\textbf{Information-Theoretic Concept} & \textbf{Empirical Validation} \\
+\midrule
+Degenerate groups $\Rightarrow$ 0 bits & Zero-variance filtering in ScaleRL \\
+$H(p) \to 0$ as $p \to 1$ & Sigmoid saturation phase \\
+Curriculum at $p \approx 0.5$ & Adaptive curriculum removes easy prompts \\
+$K \cdot H(p)$ bits per prompt & Predictable scaling with rollout count \\
+DAPO/GRESO 2$\times$ speedup & Validated at 400K GPU-hour scale \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%═══════════════════════════════════════════════════════════════════════════════
 \section{Summary}
 %═══════════════════════════════════════════════════════════════════════════════
 
@@ -721,6 +813,16 @@ Infini-AI-Lab, ``GRESO: GRPO with Efficient Selective Rollout,'' 2025.
 
 \bibitem{ittakestwo2025}
 Y.~Wu et al., ``It Takes Two: Your GRPO Is Secretly DPO,'' arXiv:2510.00977, 2025.
+
+\bibitem{scalerl2025}
+D.~Prasad et al., ``The Art of Scaling Reinforcement Learning Compute for LLMs,'' arXiv:2510.13786, 2025.
+
+\bibitem{isocompute2025}
+IsoCompute Team, ``IsoCompute Playbook: Optimally Scaling Sampling Compute for RL Training of LLMs,'' 2025.
+\url{https://compute-optimal-rl-llm-scaling.github.io/}
+
+\bibitem{qwenscaling2025}
+Qwen Team, ``Scaling Behaviors of LLM Reinforcement Learning Post-Training,'' arXiv:2509.25300, 2025.
 
 \end{thebibliography}
 
