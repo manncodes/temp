@@ -1,0 +1,52 @@
+{
+  "{{chrome}}.manifest_version": 3,
+  "{{firefox}}.manifest_version": 2,
+  "name": "MCP for claude.ai",
+  "description": "Enable MCP on claude.ai",
+  "version": "1.0.0",
+  "icons": {
+    "16": "icon/16.png",
+    "32": "icon/32.png",
+    "48": "icon/48.png",
+    "96": "icon/96.png",
+    "128": "icon/128.png"
+  },
+  "{{chrome}}.action": {
+    "default_popup": "src/popup.html"
+  },
+  "{{firefox}}.browser_action": {
+    "default_popup": "src/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://claude.ai/*"],
+      "js": ["src/content.js"],
+      "{{chrome}}.world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["*://claude.ai/*"],
+      "js": ["src/isolated-content.js"],
+      "{{chrome}}.world": "ISOLATED",
+      "run_at": "document_start"
+    }
+  ],
+  "{{chrome}}.web_accessible_resources": [
+    {
+      "resources": ["src/content.js", "src/isolated-content.js"],
+      "matches": ["*://claude.ai/*"]
+    }
+  ],
+  "{{firefox}}.web_accessible_resources": ["src/content.js", "src/isolated-content.js"],
+  "{{chrome}}.permissions": [
+    "storage"
+  ],
+  "{{firefox}}.permissions": [
+    "storage",
+    "*://claude.ai/*",
+    "*://*/*"
+  ],
+  "{{chrome}}.host_permissions": [
+    "*://claude.ai/*"
+  ]
+}
