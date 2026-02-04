@@ -1,0 +1,8 @@
+# MCP server data
+.arxiv-papers/
+
+# Node
+node_modules/
+
+# Test scripts
+test-ml-mcp.mjs
