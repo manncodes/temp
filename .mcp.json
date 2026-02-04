@@ -1,18 +1,18 @@
 {
   "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/temp"],
+    "arxiv": {
+      "command": "arxiv-mcp-server",
+      "args": ["--storage-path", "/home/user/temp/.arxiv-papers"],
       "env": {}
     },
-    "memory": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory"],
+    "fetch": {
+      "command": "python3",
+      "args": ["-m", "mcp_server_fetch"],
       "env": {}
     },
-    "sequential-thinking": {
+    "huggingface": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "args": ["-y", "mcp-remote", "https://huggingface.co/mcp"],
       "env": {}
     }
   }
