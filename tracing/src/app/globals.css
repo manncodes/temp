@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0a0a0f;
+  --bg-card: #12121a;
+  --bg-card-hover: #1a1a27;
+  --border: #2a2a3a;
+  --text: #e4e4ef;
+  --text-muted: #8888a0;
+  --accent: #6366f1;
+  --accent-light: #818cf8;
+  --green: #34d399;
+  --red: #f87171;
+  --yellow: #fbbf24;
+  --orange: #fb923c;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Heat colors for trace segments */
+.heat-0 { background: rgba(52, 211, 153, 0.15); border-bottom: 2px solid rgba(52, 211, 153, 0.6); }
+.heat-1 { background: rgba(251, 191, 36, 0.15); border-bottom: 2px solid rgba(251, 191, 36, 0.6); }
+.heat-2 { background: rgba(251, 146, 60, 0.15); border-bottom: 2px solid rgba(251, 146, 60, 0.6); }
+.heat-3 { background: rgba(248, 113, 113, 0.15); border-bottom: 2px solid rgba(248, 113, 113, 0.6); }
