@@ -1,3 +1,7 @@
+/**
+ * Server-side infini-gram client.
+ * Used by /api/trace route — fetches api.infini-gram.io directly (no CORS).
+ */
 import {
   InfinigramCountResult,
   InfinigramProbResult,
@@ -8,9 +12,9 @@ import {
 } from "./types";
 
 const INFINIGRAM_API = "https://api.infini-gram.io/";
-const DEFAULT_INDEX = "v4_rpj_llama_s4";
+export const DEFAULT_INDEX = "v4_rpj_llama_s4";
 
-async function query(payload: Record<string, unknown>) {
+export async function queryInfinigram(payload: Record<string, unknown>) {
   const res = await fetch(INFINIGRAM_API, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -29,7 +33,7 @@ export async function countNgram(
   text: string,
   index?: string
 ): Promise<InfinigramCountResult> {
-  return query({
+  return queryInfinigram({
     query_type: "count",
     query: text,
     ...(index && { index }),
@@ -40,7 +44,7 @@ export async function probNgram(
   text: string,
   index?: string
 ): Promise<InfinigramProbResult> {
-  return query({
+  return queryInfinigram({
     query_type: "infgram_prob",
     query: text,
     ...(index && { index }),
@@ -52,7 +56,7 @@ export async function searchDocs(
   maxDocs: number = 3,
   index?: string
 ): Promise<InfinigramSearchResult> {
-  return query({
+  return queryInfinigram({
     query_type: "search_docs",
     query: text,
     max_disp_len: 500,
@@ -63,52 +67,70 @@ export async function searchDocs(
 }
 
 /** Strip markdown formatting so infini-gram gets clean plain text */
-function stripMarkdown(text: string): string {
+export function stripMarkdown(text: string): string {
   return (
     text
-      // bold/italic
       .replace(/\*{1,3}([^*]+)\*{1,3}/g, "$1")
       .replace(/_{1,3}([^_]+)_{1,3}/g, "$1")
-      // inline code
       .replace(/`([^`]+)`/g, "$1")
-      // headers
       .replace(/^#{1,6}\s+/gm, "")
-      // links [text](url)
       .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-      // images
       .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
-      // blockquotes
       .replace(/^>\s+/gm, "")
-      // bullet points
       .replace(/^[-*+]\s+/gm, "")
-      // numbered lists
       .replace(/^\d+\.\s+/gm, "")
-      // horizontal rules
       .replace(/^---+$/gm, "")
-      // extra whitespace
       .replace(/\n{3,}/g, "\n\n")
       .trim()
   );
 }
 
 /**
- * Trace a full response text by splitting it into n-gram chunks,
- * querying infini-gram for each, and finding source documents.
- * This runs CLIENT-SIDE in the browser, calling the infini-gram API directly.
+ * Split text into sentence-level chunks for tracing.
+ * Targets 5–30 words per chunk for good n-gram matches.
+ */
+export function splitIntoChunks(text: string): string[] {
+  const raw = text.match(/[^.!?\n]+[.!?\n]?/g) || [text];
+  const chunks: string[] = [];
+
+  for (const r of raw) {
+    const trimmed = r.trim();
+    if (!trimmed) continue;
+    const wordCount = trimmed.split(/\s+/).length;
+
+    if (wordCount <= 30) {
+      chunks.push(trimmed);
+    } else {
+      const subParts = trimmed.split(/[,;:]/);
+      let buffer = "";
+      for (const part of subParts) {
+        if (buffer && (buffer + part).split(/\s+/).length > 25) {
+          chunks.push(buffer.trim());
+          buffer = part;
+        } else {
+          buffer += (buffer ? "," : "") + part;
+        }
+      }
+      if (buffer.trim()) chunks.push(buffer.trim());
+    }
+  }
+
+  return chunks;
+}
+
+/**
+ * Full trace: split into chunks, query infini-gram for each.
+ * Called server-side from /api/trace.
  */
 export async function traceResponse(
   responseText: string,
-  index?: string,
-  onProgress?: (done: number, total: number) => void
+  index?: string
 ): Promise<TraceResult> {
   const cleanText = stripMarkdown(responseText);
   const chunks = splitIntoChunks(cleanText);
   const segments: TraceSegment[] = [];
 
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    onProgress?.(i, chunks.length);
-
+  for (const chunk of chunks) {
     if (chunk.trim().length < 4) {
       segments.push({
         text: chunk,
@@ -144,7 +166,10 @@ export async function traceResponse(
         documents,
       });
     } catch (err) {
-      console.warn(`infini-gram trace failed for chunk "${chunk.slice(0, 40)}…":`, err);
+      console.warn(
+        `infini-gram trace failed for chunk "${chunk.slice(0, 40)}…":`,
+        err
+      );
       segments.push({
         text: chunk,
         count: -1,
@@ -155,47 +180,12 @@ export async function traceResponse(
     }
   }
 
-  onProgress?.(chunks.length, chunks.length);
-
   return {
     segments,
     fullText: responseText,
     index: index || DEFAULT_INDEX,
     totalTokens: chunks.length,
   };
-}
-
-/**
- * Split text into sentence-level chunks for tracing.
- * Targets 5–30 words per chunk for good n-gram matches.
- */
-function splitIntoChunks(text: string): string[] {
-  const raw = text.match(/[^.!?\n]+[.!?\n]?/g) || [text];
-  const chunks: string[] = [];
-
-  for (const r of raw) {
-    const trimmed = r.trim();
-    if (!trimmed) continue;
-    const wordCount = trimmed.split(/\s+/).length;
-
-    if (wordCount <= 30) {
-      chunks.push(trimmed);
-    } else {
-      const subParts = trimmed.split(/[,;:]/);
-      let buffer = "";
-      for (const part of subParts) {
-        if (buffer && (buffer + part).split(/\s+/).length > 25) {
-          chunks.push(buffer.trim());
-          buffer = part;
-        } else {
-          buffer += (buffer ? "," : "") + part;
-        }
-      }
-      if (buffer.trim()) chunks.push(buffer.trim());
-    }
-  }
-
-  return chunks;
 }
 
 export const AVAILABLE_INDEXES = [

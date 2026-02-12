@@ -11,7 +11,7 @@ import {
   Database,
 } from "lucide-react";
 import { TraceResult, TraceSegment, TraceDocument } from "@/lib/types";
-import { AVAILABLE_INDEXES, traceResponse } from "@/lib/infinigram";
+import { AVAILABLE_INDEXES, traceResponseClient } from "@/lib/infinigram-client";
 
 interface Props {
   responseText: string;
@@ -35,8 +35,8 @@ export default function TracePanel({ responseText, onTraceComplete }: Props) {
     setProgress({ done: 0, total: 0 });
 
     try {
-      // Call infini-gram directly from the browser (no server proxy)
-      const result = await traceResponse(
+      // Call our /api/trace proxy (server-side → infini-gram, avoids CORS)
+      const result = await traceResponseClient(
         responseText,
         selectedIndex,
         (done, total) => setProgress({ done, total })
