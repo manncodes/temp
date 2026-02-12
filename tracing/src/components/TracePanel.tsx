@@ -9,6 +9,7 @@ import {
   BookOpen,
   BarChart3,
   Database,
+  Zap,
 } from "lucide-react";
 import { TraceResult, TraceSegment, TraceDocument } from "@/lib/types";
 import { AVAILABLE_INDEXES, traceResponseClient } from "@/lib/infinigram-client";
@@ -35,7 +36,6 @@ export default function TracePanel({ responseText, onTraceComplete }: Props) {
     setProgress({ done: 0, total: 0 });
 
     try {
-      // Call our /api/trace proxy (server-side → infini-gram, avoids CORS)
       const result = await traceResponseClient(
         responseText,
         selectedIndex,
@@ -56,27 +56,37 @@ export default function TracePanel({ responseText, onTraceComplete }: Props) {
     }
   }, [responseText, trace]);
 
+  /** Map normalized score → heat CSS class */
   function heatClass(segment: TraceSegment): string {
-    if (segment.count <= 0) return "";
-    if (segment.count < 5) return "heat-0";
-    if (segment.count < 50) return "heat-1";
-    if (segment.count < 500) return "heat-2";
+    const s = segment.normalizedScore;
+    if (s <= 0) return "";
+    if (s < 0.25) return "heat-0";
+    if (s < 0.5) return "heat-1";
+    if (s < 0.75) return "heat-2";
     return "heat-3";
   }
 
   const stats = traceResult
-    ? {
-        total: traceResult.segments.length,
-        found: traceResult.segments.filter((s) => s.count > 0).length,
-        withDocs: traceResult.segments.filter(
-          (s) => s.documents.length > 0
-        ).length,
-        avgCount:
-          traceResult.segments.reduce(
-            (sum, s) => sum + Math.max(0, s.count),
-            0
-          ) / traceResult.segments.length,
-      }
+    ? (() => {
+        const segs = traceResult.segments;
+        const matched = segs.filter((s) => s.count > 0);
+        const avgScore =
+          segs.length > 0
+            ? segs.reduce((sum, s) => sum + s.normalizedScore, 0) / segs.length
+            : 0;
+        const avgMatchRatio =
+          matched.length > 0
+            ? matched.reduce((sum, s) => sum + s.matchRatio, 0) /
+              matched.length
+            : 0;
+        return {
+          total: segs.length,
+          found: matched.length,
+          withDocs: segs.filter((s) => s.documents.length > 0).length,
+          avgScore,
+          avgMatchRatio,
+        };
+      })()
     : null;
 
   return (
@@ -169,39 +179,40 @@ export default function TracePanel({ responseText, onTraceComplete }: Props) {
                 />
                 <StatCard
                   icon={<Database className="w-3.5 h-3.5" />}
-                  label="Found"
+                  label="Matched"
                   value={`${stats.found}/${stats.total}`}
                 />
                 <StatCard
-                  icon={<BookOpen className="w-3.5 h-3.5" />}
-                  label="With Sources"
-                  value={String(stats.withDocs)}
+                  icon={<Zap className="w-3.5 h-3.5" />}
+                  label="Avg Score"
+                  value={`${(stats.avgScore * 100).toFixed(0)}%`}
                 />
                 <StatCard
-                  icon={<BarChart3 className="w-3.5 h-3.5" />}
-                  label="Avg Count"
-                  value={stats.avgCount.toFixed(0)}
+                  icon={<BookOpen className="w-3.5 h-3.5" />}
+                  label="Avg Match"
+                  value={`${(stats.avgMatchRatio * 100).toFixed(0)}%`}
                 />
               </div>
             )}
 
             {/* Legend */}
             <div className="flex items-center gap-4 text-xs text-[var(--text-muted)]">
+              <span>Memorization:</span>
               <span className="flex items-center gap-1">
-                <span className="w-3 h-2 rounded-sm heat-0 inline-block" />{" "}
-                rare
+                <span className="w-3 h-2 rounded-sm heat-0 inline-block" />
+                low
               </span>
               <span className="flex items-center gap-1">
-                <span className="w-3 h-2 rounded-sm heat-1 inline-block" />{" "}
-                uncommon
+                <span className="w-3 h-2 rounded-sm heat-1 inline-block" />
+                moderate
               </span>
               <span className="flex items-center gap-1">
-                <span className="w-3 h-2 rounded-sm heat-2 inline-block" />{" "}
-                common
+                <span className="w-3 h-2 rounded-sm heat-2 inline-block" />
+                high
               </span>
               <span className="flex items-center gap-1">
-                <span className="w-3 h-2 rounded-sm heat-3 inline-block" />{" "}
-                very common
+                <span className="w-3 h-2 rounded-sm heat-3 inline-block" />
+                verbatim
               </span>
             </div>
 
@@ -252,6 +263,37 @@ function StatCard({
   );
 }
 
+/** Format a score as a colored bar + percentage */
+function ScoreBar({ score, label }: { score: number; label: string }) {
+  const pct = Math.round(score * 100);
+  const color =
+    pct >= 75
+      ? "bg-red-500"
+      : pct >= 50
+        ? "bg-orange-400"
+        : pct >= 25
+          ? "bg-yellow-400"
+          : pct > 0
+            ? "bg-green-400"
+            : "bg-gray-300";
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-[var(--text-muted)] text-xs w-20 shrink-0">
+        {label}
+      </span>
+      <div className="flex-1 h-1.5 bg-[var(--border)] rounded-full overflow-hidden">
+        <div
+          className={`h-full rounded-full ${color}`}
+          style={{ width: `${Math.max(pct, 2)}%` }}
+        />
+      </div>
+      <span className="text-xs tabular-nums w-10 text-right font-medium">
+        {pct}%
+      </span>
+    </div>
+  );
+}
+
 function SegmentRow({
   segment,
   index,
@@ -265,6 +307,7 @@ function SegmentRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const scorePct = Math.round(segment.normalizedScore * 100);
   return (
     <div className="rounded border border-[var(--border)] overflow-hidden">
       <button
@@ -281,17 +324,38 @@ function SegmentRow({
         </span>
         <span className="text-sm truncate flex-1">{segment.text}</span>
         <span className="text-xs text-[var(--text-muted)] shrink-0 tabular-nums">
-          {segment.count >= 0 ? segment.count.toLocaleString() : "—"} hits
+          {scorePct > 0 ? `${scorePct}%` : "—"}
         </span>
       </button>
 
       {expanded && (
         <div className="px-3 py-3 border-t border-[var(--border)] bg-[var(--bg)] space-y-3">
+          {/* Score bars */}
+          <div className="space-y-1.5">
+            <ScoreBar
+              score={segment.normalizedScore}
+              label="Score"
+            />
+            <ScoreBar
+              score={segment.matchRatio}
+              label="Match"
+            />
+          </div>
+
+          {/* Details grid */}
           <div className="grid grid-cols-3 gap-3 text-xs">
             <div>
               <span className="text-[var(--text-muted)]">Count:</span>{" "}
               <span className="font-medium">
                 {segment.count >= 0 ? segment.count.toLocaleString() : "N/A"}
+              </span>
+            </div>
+            <div>
+              <span className="text-[var(--text-muted)]">Matched:</span>{" "}
+              <span className="font-medium">
+                {segment.matchedWords > 0
+                  ? `${segment.matchedWords} words`
+                  : "none"}
               </span>
             </div>
             <div>
@@ -302,11 +366,19 @@ function SegmentRow({
                   : "N/A"}
               </span>
             </div>
-            <div>
-              <span className="text-[var(--text-muted)]">Effective N:</span>{" "}
-              <span className="font-medium">{segment.effectiveN || "—"}</span>
-            </div>
           </div>
+
+          {/* Show the matched substring */}
+          {segment.matchedText && (
+            <div className="text-xs">
+              <span className="text-[var(--text-muted)]">
+                Verbatim match:
+              </span>
+              <p className="mt-1 font-mono bg-[var(--bg-card)] border border-[var(--border)] rounded px-2 py-1.5 text-[var(--accent)] break-words">
+                &quot;{segment.matchedText}&quot;
+              </p>
+            </div>
+          )}
 
           {segment.documents.length > 0 ? (
             <div>
@@ -337,7 +409,7 @@ function DocumentCard({ doc }: { doc: TraceDocument }) {
       <div className="flex items-center gap-2 text-[10px] text-[var(--text-muted)] mb-1">
         <span>Doc #{doc.doc_ix}</span>
         <span>|</span>
-        <span>{doc.doc_len?.toLocaleString()} tokens</span>
+        <span>{doc.doc_len?.toLocaleString()} chars</span>
         {doc.metadata && (
           <>
             <span>|</span>

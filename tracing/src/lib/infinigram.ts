@@ -290,6 +290,142 @@ export function splitIntoChunks(text: string): string[] {
 }
 
 // ──────────────────────────────────────────────
+// Maximal matching (OLMoTrace-style)
+// ──────────────────────────────────────────────
+
+/**
+ * Binary search for the longest prefix of `words` (by word count) that
+ * has count > 0 in the corpus. Returns the matched word count and count.
+ *
+ * For the mini engine this is character-level exact matching, so full
+ * sentences rarely match — but shorter sub-phrases often do.
+ */
+async function findLongestMatchingPrefix(
+  words: string[],
+  index: string
+): Promise<{ matchedWords: number; matchedText: string; count: number }> {
+  if (words.length === 0) {
+    return { matchedWords: 0, matchedText: "", count: 0 };
+  }
+
+  // First try the full text
+  const fullText = words.join(" ");
+  const fullResult = await countNgram(fullText, index);
+  if (fullResult.count > 0) {
+    return {
+      matchedWords: words.length,
+      matchedText: fullText,
+      count: fullResult.count,
+    };
+  }
+
+  // Binary search on prefix length (by word count)
+  let lo = 1;
+  let hi = words.length - 1;
+  let bestLen = 0;
+  let bestCount = 0;
+
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const prefix = words.slice(0, mid).join(" ");
+    const result = await countNgram(prefix, index);
+    if (result.count > 0) {
+      bestLen = mid;
+      bestCount = result.count;
+      lo = mid + 1; // try longer
+    } else {
+      hi = mid - 1; // try shorter
+    }
+  }
+
+  return {
+    matchedWords: bestLen,
+    matchedText: bestLen > 0 ? words.slice(0, bestLen).join(" ") : "",
+    count: bestCount,
+  };
+}
+
+/**
+ * For each chunk, also try suffixes (starting from later words) to find
+ * additional matches beyond just the prefix. This catches cases where
+ * the end of a sentence is memorized but the beginning isn't.
+ */
+async function findBestMatch(
+  words: string[],
+  index: string
+): Promise<{ matchedWords: number; matchedText: string; count: number; startWord: number }> {
+  // Try prefix first (most common case, fastest)
+  const prefix = await findLongestMatchingPrefix(words, index);
+
+  // If we matched most of the chunk from the start, that's good enough
+  if (prefix.matchedWords >= words.length * 0.5) {
+    return { ...prefix, startWord: 0 };
+  }
+
+  // Also try from the middle and from the end
+  let best = { ...prefix, startWord: 0 };
+
+  const midStart = Math.floor(words.length / 2);
+  if (midStart > 0 && midStart < words.length) {
+    const midMatch = await findLongestMatchingPrefix(
+      words.slice(midStart),
+      index
+    );
+    if (midMatch.matchedWords > best.matchedWords) {
+      best = { ...midMatch, startWord: midStart };
+    }
+  }
+
+  // Try last third
+  const lateStart = Math.floor(words.length * 0.67);
+  if (lateStart > midStart && lateStart < words.length) {
+    const lateMatch = await findLongestMatchingPrefix(
+      words.slice(lateStart),
+      index
+    );
+    if (lateMatch.matchedWords > best.matchedWords) {
+      best = { ...lateMatch, startWord: lateStart };
+    }
+  }
+
+  return best;
+}
+
+// ──────────────────────────────────────────────
+// Segment normalization
+// ──────────────────────────────────────────────
+
+/**
+ * Compute a normalized memorization score for a segment.
+ *
+ * Score combines:
+ *  - matchRatio: what fraction of the chunk matched verbatim (0–1)
+ *  - countSignal: log-scaled count relative to expected (higher = more copies)
+ *  - lengthBonus: longer verbatim matches are more significant
+ *
+ * Result is in [0, 1] where 1 = highly memorized.
+ */
+function computeNormalizedScore(
+  matchedWords: number,
+  totalWords: number,
+  count: number
+): number {
+  if (matchedWords === 0 || count === 0) return 0;
+
+  const matchRatio = matchedWords / totalWords;
+
+  // Log-scale the count: log2(count+1) / log2(threshold)
+  // A count of ~1000 is "saturated" at 1.0
+  const countSignal = Math.min(1, Math.log2(count + 1) / Math.log2(1000));
+
+  // Bonus for longer matches: 2-word match = 0.3, 5-word = 0.65, 10+ = ~1.0
+  const lengthBonus = Math.min(1, Math.log2(matchedWords + 1) / Math.log2(12));
+
+  // Weighted combination
+  return Math.min(1, matchRatio * 0.3 + countSignal * 0.3 + lengthBonus * 0.4);
+}
+
+// ──────────────────────────────────────────────
 // Full trace (server-side, called from /api/trace)
 // ──────────────────────────────────────────────
 
@@ -300,12 +436,27 @@ export async function traceResponse(
   const cleanText = stripMarkdown(responseText);
   const chunks = splitIntoChunks(cleanText);
   const segments: TraceSegment[] = [];
+  const isMini = getEngine(index) === "mini";
+
+  // Optional: get corpus size for context (empty string count = total bytes)
+  let corpusSize: number | undefined;
+  try {
+    const csResult = await countNgram("", index);
+    corpusSize = csResult.count;
+  } catch {
+    // not critical
+  }
 
   for (const chunk of chunks) {
-    if (chunk.trim().length < 4) {
+    const trimmed = chunk.trim();
+    if (trimmed.length < 4) {
       segments.push({
         text: chunk,
-        count: -1,
+        matchedText: "",
+        count: 0,
+        matchRatio: 0,
+        normalizedScore: 0,
+        matchedWords: 0,
         prob: -1,
         effectiveN: 0,
         documents: [],
@@ -314,25 +465,46 @@ export async function traceResponse(
     }
 
     try {
-      const [countResult, probResult] = await Promise.all([
-        countNgram(chunk, index),
-        probNgram(chunk, index),
-      ]);
+      const words = trimmed.split(/\s+/);
 
+      // Step 1: Find longest verbatim match (OLMoTrace-style)
+      const match = isMini
+        ? await findBestMatch(words, index)
+        : await findLongestMatchingPrefix(words, index);
+
+      const matchRatio =
+        match.matchedWords > 0 ? match.matchedWords / words.length : 0;
+
+      // Step 2: Get probability (original engine only)
+      const probResult = await probNgram(trimmed, index);
+
+      // Step 3: Compute normalized score
+      const normalizedScore = computeNormalizedScore(
+        match.matchedWords,
+        words.length,
+        match.count
+      );
+
+      // Step 4: Retrieve source documents for the matched substring
       let documents: TraceDocument[] = [];
-      if (countResult.count > 0) {
+      if (match.count > 0 && match.matchedText) {
         try {
-          documents = await searchDocs(chunk, 3, index);
+          documents = await searchDocs(match.matchedText, 3, index);
         } catch {
-          // search_docs can fail for very common n-grams
+          // doc retrieval can fail for very common strings
         }
       }
 
       segments.push({
         text: chunk,
-        count: countResult.count,
+        matchedText: match.matchedText,
+        count: match.count,
+        matchRatio,
+        normalizedScore,
+        matchedWords: match.matchedWords,
         prob: probResult.prob,
-        effectiveN: probResult.suffix_len ?? chunk.split(/\s+/).length,
+        effectiveN:
+          (probResult.suffix_len ?? match.matchedWords) || words.length,
         documents,
       });
     } catch (err) {
@@ -342,7 +514,11 @@ export async function traceResponse(
       );
       segments.push({
         text: chunk,
+        matchedText: "",
         count: -1,
+        matchRatio: 0,
+        normalizedScore: 0,
+        matchedWords: 0,
         prob: -1,
         effectiveN: 0,
         documents: [],
@@ -355,5 +531,6 @@ export async function traceResponse(
     fullText: responseText,
     index,
     totalTokens: chunks.length,
+    corpusSize,
   };
 }

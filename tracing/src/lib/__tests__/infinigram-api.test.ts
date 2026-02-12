@@ -4,6 +4,10 @@
  * index names, count queries, and document retrieval.
  *
  * Run with: npx tsx src/lib/__tests__/infinigram-api.test.ts
+ *
+ * If fetch fails, try: curl -X POST -H "Content-Type: application/json" \
+ *   -d '{"index":"v2_cc-2025-05","query_type":"count","query":"hello"}' \
+ *   https://api.infini-gram-mini.io/
  */
 
 const MINI_API = "https://api.infini-gram-mini.io/";
@@ -19,13 +23,22 @@ interface TestResult {
 const results: TestResult[] = [];
 
 async function postJson(url: string, payload: Record<string, unknown>) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const json = await res.json();
-  return { status: res.status, json };
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json();
+    return { status: res.status, json };
+  } catch (err: unknown) {
+    // Show the underlying cause (DNS, TLS, network)
+    const cause = (err as { cause?: Error })?.cause;
+    const detail = cause
+      ? `${cause.message} (code: ${(cause as NodeJS.ErrnoException).code})`
+      : (err as Error).message;
+    throw new Error(`fetch ${url} failed: ${detail}`);
+  }
 }
 
 function record(name: string, pass: boolean, detail: string, data?: unknown) {
@@ -287,46 +300,67 @@ async function testOriginalSearchDocs() {
 async function main() {
   console.log("=== infini-gram API Diagnostic Tests ===\n");
 
+  // Pre-check: verify DNS + connectivity
+  console.log("Connectivity pre-check...");
+  for (const [name, url] of [["Mini", MINI_API], ["Original", ORIGINAL_API]] as const) {
+    try {
+      const res = await fetch(url, { method: "HEAD" }).catch(() =>
+        fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+      );
+      console.log(`  ${name} API (${url}): HTTP ${res.status} — reachable`);
+    } catch (err: unknown) {
+      const cause = (err as { cause?: Error })?.cause;
+      const code = (cause as NodeJS.ErrnoException | undefined)?.code;
+      console.log(`  \x1b[31m${name} API (${url}): UNREACHABLE\x1b[0m`);
+      console.log(`    Error: ${cause?.message || (err as Error).message}`);
+      if (code) console.log(`    Code: ${code}`);
+      console.log(`    Try: curl -sS -X POST -H "Content-Type: application/json" \\`);
+      console.log(`      -d '{"index":"v2_cc-2025-05","query_type":"count","query":"test"}' \\`);
+      console.log(`      ${url}`);
+    }
+  }
+  console.log();
+
   try {
     await testMiniIndexNameFormats();
   } catch (e) {
-    record("Mini index name test", false, `Network error: ${e}`);
+    record("Mini index name test", false, `${e}`);
   }
 
   try {
     await testMiniCountAllCCIndexes();
   } catch (e) {
-    record("Mini CC indexes", false, `Network error: ${e}`);
+    record("Mini CC indexes", false, `${e}`);
   }
 
   try {
     await testMiniCountCurated();
   } catch (e) {
-    record("Mini curated indexes", false, `Network error: ${e}`);
+    record("Mini curated indexes", false, `${e}`);
   }
 
   try {
     await testMiniFindAndGetDoc();
   } catch (e) {
-    record("Mini find+doc", false, `Network error: ${e}`);
+    record("Mini find+doc", false, `${e}`);
   }
 
   try {
     await testOriginalCount();
   } catch (e) {
-    record("Original count", false, `Network error: ${e}`);
+    record("Original count", false, `${e}`);
   }
 
   try {
     await testMiniQueryLengths();
   } catch (e) {
-    record("Mini query lengths", false, `Network error: ${e}`);
+    record("Mini query lengths", false, `${e}`);
   }
 
   try {
     await testOriginalSearchDocs();
   } catch (e) {
-    record("Original search_docs", false, `Network error: ${e}`);
+    record("Original search_docs", false, `${e}`);
   }
 
   console.log("\n=== SUMMARY ===");

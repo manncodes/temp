@@ -21,8 +21,19 @@ export interface ChatMessage {
 }
 
 export interface TraceSegment {
+  /** The full chunk text */
   text: string;
+  /** The longest verbatim substring found in corpus */
+  matchedText: string;
+  /** Raw count of the matched substring in the corpus */
   count: number;
+  /** Fraction of chunk that matched verbatim (0–1) */
+  matchRatio: number;
+  /** Normalized memorization score (higher = more memorized) */
+  normalizedScore: number;
+  /** Number of words in the matched substring */
+  matchedWords: number;
+  /** prob from original engine, -1 for mini */
   prob: number;
   /** effective n-gram length used by infini-gram */
   effectiveN: number;
@@ -42,6 +53,8 @@ export interface TraceResult {
   fullText: string;
   index: string;
   totalTokens: number;
+  /** Corpus-level total byte count (for normalization context) */
+  corpusSize?: number;
 }
 
 export interface InfinigramCountResult {
