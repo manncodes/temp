@@ -24,13 +24,13 @@ export const DEFAULT_INDEX = "v4_rpj_llama_s4";
 
 export const AVAILABLE_INDEXES: IndexEntry[] = [
   // ── infini-gram mini: Common Crawl (massive, 8–10 TB each) ──
-  { id: "v2_cc_2025-30", label: "Common Crawl Jul 2025", engine: "mini", size: "9.0 TB" },
-  { id: "v2_cc_2025-26", label: "Common Crawl Jun 2025", engine: "mini", size: "8.7 TB" },
-  { id: "v2_cc_2025-21", label: "Common Crawl May 2025", engine: "mini", size: "9.2 TB" },
-  { id: "v2_cc_2025-18", label: "Common Crawl Apr 2025", engine: "mini", size: "10.5 TB" },
-  { id: "v2_cc_2025-13", label: "Common Crawl Mar 2025", engine: "mini", size: "10.4 TB" },
-  { id: "v2_cc_2025-08", label: "Common Crawl Feb 2025", engine: "mini", size: "8.2 TB" },
-  { id: "v2_cc_2025-05", label: "Common Crawl Jan 2025", engine: "mini", size: "9.1 TB" },
+  { id: "v2_cc-2025-30", label: "Common Crawl Jul 2025", engine: "mini", size: "9.0 TB" },
+  { id: "v2_cc-2025-26", label: "Common Crawl Jun 2025", engine: "mini", size: "8.7 TB" },
+  { id: "v2_cc-2025-21", label: "Common Crawl May 2025", engine: "mini", size: "9.2 TB" },
+  { id: "v2_cc-2025-18", label: "Common Crawl Apr 2025", engine: "mini", size: "10.5 TB" },
+  { id: "v2_cc-2025-13", label: "Common Crawl Mar 2025", engine: "mini", size: "10.4 TB" },
+  { id: "v2_cc-2025-08", label: "Common Crawl Feb 2025", engine: "mini", size: "8.2 TB" },
+  { id: "v2_cc-2025-05", label: "Common Crawl Jan 2025", engine: "mini", size: "9.1 TB" },
 
   // ── infini-gram mini: Curated datasets ──
   { id: "v2_dclm_all", label: "DCLM-baseline", engine: "mini", size: "16.7 TB" },
