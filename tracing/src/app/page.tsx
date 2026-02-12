@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { Layers } from "lucide-react";
-import { VllmDeployment } from "@/lib/types";
+import { VllmDeployment, TraceResult } from "@/lib/types";
 import DeploymentScanner from "@/components/DeploymentScanner";
 import ChatPanel from "@/components/ChatPanel";
 import TracePanel from "@/components/TracePanel";
@@ -11,6 +11,11 @@ export default function Home() {
   const [selectedDeployment, setSelectedDeployment] =
     useState<VllmDeployment | null>(null);
   const [lastResponse, setLastResponse] = useState("");
+  const [traceResult, setTraceResult] = useState<TraceResult | null>(null);
+
+  const handleTraceComplete = useCallback((result: TraceResult | null) => {
+    setTraceResult(result);
+  }, []);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -38,12 +43,16 @@ export default function Home() {
           <ChatPanel
             deployment={selectedDeployment}
             onResponse={setLastResponse}
+            traceResult={traceResult}
           />
         </main>
 
         {/* Right sidebar: trace */}
         <aside className="w-[480px] shrink-0 border-l border-[var(--border)] overflow-y-auto p-4">
-          <TracePanel responseText={lastResponse} />
+          <TracePanel
+            responseText={lastResponse}
+            onTraceComplete={handleTraceComplete}
+          />
         </aside>
       </div>
     </div>

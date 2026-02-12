@@ -1,6 +1,24 @@
 import { VllmDeployment } from "./types";
 
 /**
+ * If running inside Kubernetes, strip proxy env vars so cluster-internal
+ * fetch() calls don't get routed through an external proxy.
+ */
+function clearProxyIfInCluster() {
+  if (
+    typeof process !== "undefined" &&
+    process.env.KUBERNETES_SERVICE_HOST &&
+    process.env.KUBERNETES_SERVICE_HOST !== ""
+  ) {
+    for (const key of ["https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"]) {
+      if (process.env[key]) delete process.env[key];
+    }
+    if (process.env.NO_PROXY) process.env.NO_PROXY += ",.svc.cluster.local";
+    if (process.env.no_proxy) process.env.no_proxy += ",.svc.cluster.local";
+  }
+}
+
+/**
  * Attempt to discover vLLM deployments by:
  * 1. Running kubectl to list services (if available)
  * 2. Probing provided manual endpoints
@@ -11,6 +29,8 @@ export async function scanCluster(
   manualEndpoints: string,
   defaultPort: number
 ): Promise<VllmDeployment[]> {
+  clearProxyIfInCluster();
+
   const deployments: VllmDeployment[] = [];
   const seen = new Set<string>();
 

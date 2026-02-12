@@ -2,8 +2,8 @@ import {
   InfinigramCountResult,
   InfinigramProbResult,
   InfinigramSearchResult,
-  TraceSegment,
   TraceDocument,
+  TraceSegment,
   TraceResult,
 } from "./types";
 
@@ -17,7 +17,10 @@ async function query(payload: Record<string, unknown>) {
     body: JSON.stringify({ index: DEFAULT_INDEX, ...payload }),
   });
   if (!res.ok) {
-    throw new Error(`infini-gram API error: ${res.status} ${res.statusText}`);
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `infini-gram API error: ${res.status} ${res.statusText} — ${body}`
+    );
   }
   return res.json();
 }
@@ -59,21 +62,54 @@ export async function searchDocs(
   });
 }
 
+/** Strip markdown formatting so infini-gram gets clean plain text */
+function stripMarkdown(text: string): string {
+  return (
+    text
+      // bold/italic
+      .replace(/\*{1,3}([^*]+)\*{1,3}/g, "$1")
+      .replace(/_{1,3}([^_]+)_{1,3}/g, "$1")
+      // inline code
+      .replace(/`([^`]+)`/g, "$1")
+      // headers
+      .replace(/^#{1,6}\s+/gm, "")
+      // links [text](url)
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      // images
+      .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+      // blockquotes
+      .replace(/^>\s+/gm, "")
+      // bullet points
+      .replace(/^[-*+]\s+/gm, "")
+      // numbered lists
+      .replace(/^\d+\.\s+/gm, "")
+      // horizontal rules
+      .replace(/^---+$/gm, "")
+      // extra whitespace
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  );
+}
+
 /**
- * Trace a full response text by splitting it into overlapping n-gram windows,
- * computing infini-gram probabilities for each, and retrieving source documents
- * for low-probability (memorized) segments.
+ * Trace a full response text by splitting it into n-gram chunks,
+ * querying infini-gram for each, and finding source documents.
+ * This runs CLIENT-SIDE in the browser, calling the infini-gram API directly.
  */
 export async function traceResponse(
   responseText: string,
-  index?: string
+  index?: string,
+  onProgress?: (done: number, total: number) => void
 ): Promise<TraceResult> {
-  // Split into sentences / meaningful chunks for tracing
-  const chunks = splitIntoChunks(responseText);
+  const cleanText = stripMarkdown(responseText);
+  const chunks = splitIntoChunks(cleanText);
   const segments: TraceSegment[] = [];
 
-  for (const chunk of chunks) {
-    if (chunk.trim().length < 3) {
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    onProgress?.(i, chunks.length);
+
+    if (chunk.trim().length < 4) {
       segments.push({
         text: chunk,
         count: -1,
@@ -85,20 +121,18 @@ export async function traceResponse(
     }
 
     try {
-      // Run count and probability queries in parallel
       const [countResult, probResult] = await Promise.all([
         countNgram(chunk, index),
         probNgram(chunk, index),
       ]);
 
       let documents: TraceDocument[] = [];
-      // If the n-gram appears in the corpus, find source documents
       if (countResult.count > 0) {
         try {
           const searchResult = await searchDocs(chunk, 3, index);
           documents = searchResult.documents || [];
         } catch {
-          // search_docs can fail for very common n-grams; that's okay
+          // search_docs can fail for very common n-grams
         }
       }
 
@@ -109,7 +143,8 @@ export async function traceResponse(
         effectiveN: probResult.suffix_len ?? chunk.split(/\s+/).length,
         documents,
       });
-    } catch {
+    } catch (err) {
+      console.warn(`infini-gram trace failed for chunk "${chunk.slice(0, 40)}…":`, err);
       segments.push({
         text: chunk,
         count: -1,
@@ -119,6 +154,8 @@ export async function traceResponse(
       });
     }
   }
+
+  onProgress?.(chunks.length, chunks.length);
 
   return {
     segments,
@@ -130,10 +167,9 @@ export async function traceResponse(
 
 /**
  * Split text into sentence-level chunks for tracing.
- * We try to keep chunks between 5–40 words to get meaningful n-gram lookups.
+ * Targets 5–30 words per chunk for good n-gram matches.
  */
 function splitIntoChunks(text: string): string[] {
-  // Split on sentence boundaries
   const raw = text.match(/[^.!?\n]+[.!?\n]?/g) || [text];
   const chunks: string[] = [];
 
@@ -142,14 +178,13 @@ function splitIntoChunks(text: string): string[] {
     if (!trimmed) continue;
     const wordCount = trimmed.split(/\s+/).length;
 
-    if (wordCount <= 40) {
+    if (wordCount <= 30) {
       chunks.push(trimmed);
     } else {
-      // Break long sentences into smaller pieces at clause boundaries
       const subParts = trimmed.split(/[,;:]/);
       let buffer = "";
       for (const part of subParts) {
-        if (buffer && (buffer + part).split(/\s+/).length > 30) {
+        if (buffer && (buffer + part).split(/\s+/).length > 25) {
           chunks.push(buffer.trim());
           buffer = part;
         } else {
@@ -164,11 +199,11 @@ function splitIntoChunks(text: string): string[] {
 }
 
 export const AVAILABLE_INDEXES = [
-  { id: "v4_rpj_llama_s4", label: "RedPajama + Dolma + Pile + C4 (Llama tokenizer)" },
-  { id: "v4_dolma-v1_7_llama", label: "Dolma v1.7 (Llama tokenizer)" },
-  { id: "v4_rpj_llama", label: "RedPajama (Llama tokenizer)" },
-  { id: "v4_piletrain_llama", label: "Pile Train (Llama tokenizer)" },
-  { id: "v4_c4train_llama", label: "C4 Train (Llama tokenizer)" },
-  { id: "v4_rpj_gpt2", label: "RedPajama (GPT-2 tokenizer)" },
-  { id: "v4_dolma-v1_7_gpt2", label: "Dolma v1.7 (GPT-2 tokenizer)" },
+  { id: "v4_rpj_llama_s4", label: "RedPajama + Dolma + Pile + C4 (Llama)" },
+  { id: "v4_dolma-v1_7_llama", label: "Dolma v1.7 (Llama)" },
+  { id: "v4_rpj_llama", label: "RedPajama (Llama)" },
+  { id: "v4_piletrain_llama", label: "Pile Train (Llama)" },
+  { id: "v4_c4train_llama", label: "C4 Train (Llama)" },
+  { id: "v4_rpj_gpt2", label: "RedPajama (GPT-2)" },
+  { id: "v4_dolma-v1_7_gpt2", label: "Dolma v1.7 (GPT-2)" },
 ];

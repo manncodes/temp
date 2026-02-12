@@ -2,14 +2,31 @@
 
 import { useState, useRef, useEffect } from "react";
 import { Send, Bot, User, Loader2, Settings2 } from "lucide-react";
-import { VllmDeployment, ChatMessage } from "@/lib/types";
+import { VllmDeployment, ChatMessage, TraceResult, TraceSegment } from "@/lib/types";
 
 interface Props {
   deployment: VllmDeployment | null;
   onResponse: (text: string) => void;
+  traceResult: TraceResult | null;
 }
 
-export default function ChatPanel({ deployment, onResponse }: Props) {
+function heatClass(segment: TraceSegment): string {
+  if (segment.count <= 0) return "";
+  if (segment.count < 5) return "heat-0";
+  if (segment.count < 50) return "heat-1";
+  if (segment.count < 500) return "heat-2";
+  return "heat-3";
+}
+
+function heatTooltip(segment: TraceSegment): string {
+  const parts: string[] = [];
+  if (segment.count >= 0) parts.push(`${segment.count.toLocaleString()} hits`);
+  if (segment.prob >= 0) parts.push(`p=${(segment.prob * 100).toFixed(1)}%`);
+  if (segment.documents.length > 0) parts.push(`${segment.documents.length} sources`);
+  return parts.join(" | ") || "not found in corpus";
+}
+
+export default function ChatPanel({ deployment, onResponse, traceResult }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -17,11 +34,23 @@ export default function ChatPanel({ deployment, onResponse }: Props) {
   const [temperature, setTemperature] = useState(0.7);
   const [maxTokens, setMaxTokens] = useState(1024);
   const [apiKey, setApiKey] = useState("");
+  // Track which message index was the last assistant response that was traced
+  const [tracedMessageIndex, setTracedMessageIndex] = useState(-1);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, traceResult]);
+
+  // When a new trace result arrives, associate it with the last assistant message
+  useEffect(() => {
+    if (traceResult) {
+      const lastAssistantIdx = messages.findLastIndex((m) => m.role === "assistant");
+      if (lastAssistantIdx >= 0) {
+        setTracedMessageIndex(lastAssistantIdx);
+      }
+    }
+  }, [traceResult, messages]);
 
   async function send() {
     if (!input.trim() || !deployment || deployment.status !== "online") return;
@@ -64,6 +93,27 @@ export default function ChatPanel({ deployment, onResponse }: Props) {
     } finally {
       setLoading(false);
     }
+  }
+
+  function renderAssistantContent(content: string, messageIndex: number) {
+    // If this message has trace results, render with highlights
+    if (traceResult && messageIndex === tracedMessageIndex) {
+      return (
+        <div className="text-sm leading-relaxed">
+          {traceResult.segments.map((seg, i) => (
+            <span
+              key={i}
+              className={`rounded-sm px-0.5 cursor-help ${heatClass(seg)} transition-colors`}
+              title={heatTooltip(seg)}
+            >
+              {seg.text}{" "}
+            </span>
+          ))}
+        </div>
+      );
+    }
+    // Default: plain text
+    return <span className="text-sm whitespace-pre-wrap">{content}</span>;
   }
 
   return (
@@ -158,13 +208,15 @@ export default function ChatPanel({ deployment, onResponse }: Props) {
               </div>
             )}
             <div
-              className={`max-w-[80%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap ${
+              className={`max-w-[85%] rounded-lg px-3 py-2 ${
                 msg.role === "user"
-                  ? "bg-[var(--accent)] text-white"
+                  ? "bg-[var(--accent)] text-white text-sm whitespace-pre-wrap"
                   : "bg-[var(--bg)] border border-[var(--border)]"
               }`}
             >
-              {msg.content}
+              {msg.role === "assistant"
+                ? renderAssistantContent(msg.content, i)
+                : msg.content}
             </div>
             {msg.role === "user" && (
               <div className="shrink-0 w-7 h-7 rounded-full bg-[var(--bg)] border border-[var(--border)] flex items-center justify-center">
@@ -185,6 +237,28 @@ export default function ChatPanel({ deployment, onResponse }: Props) {
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* Trace legend (shown when trace is active) */}
+      {traceResult && tracedMessageIndex >= 0 && (
+        <div className="px-4 py-2 border-t border-[var(--border)] bg-[var(--bg)]">
+          <div className="flex items-center gap-3 text-[10px] text-[var(--text-muted)]">
+            <span className="font-medium uppercase tracking-wider">Trace:</span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-1.5 rounded-sm heat-0 inline-block" /> rare
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-1.5 rounded-sm heat-1 inline-block" /> uncommon
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-1.5 rounded-sm heat-2 inline-block" /> common
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-1.5 rounded-sm heat-3 inline-block" /> very common
+            </span>
+            <span className="ml-auto">hover for details</span>
+          </div>
+        </div>
+      )}
 
       {/* Input */}
       <div className="p-3 border-t border-[var(--border)]">

@@ -11,15 +11,17 @@ import {
   Database,
 } from "lucide-react";
 import { TraceResult, TraceSegment, TraceDocument } from "@/lib/types";
-import { AVAILABLE_INDEXES } from "@/lib/infinigram";
+import { AVAILABLE_INDEXES, traceResponse } from "@/lib/infinigram";
 
 interface Props {
   responseText: string;
+  onTraceComplete: (result: TraceResult | null) => void;
 }
 
-export default function TracePanel({ responseText }: Props) {
+export default function TracePanel({ responseText, onTraceComplete }: Props) {
   const [traceResult, setTraceResult] = useState<TraceResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [error, setError] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(AVAILABLE_INDEXES[0].id);
   const [expandedSegment, setExpandedSegment] = useState<number | null>(null);
@@ -29,26 +31,24 @@ export default function TracePanel({ responseText }: Props) {
     setLoading(true);
     setError("");
     setTraceResult(null);
+    onTraceComplete(null);
+    setProgress({ done: 0, total: 0 });
 
     try {
-      const res = await fetch("/api/trace", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: responseText,
-          index: selectedIndex,
-          mode: "full",
-        }),
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setTraceResult(data);
+      // Call infini-gram directly from the browser (no server proxy)
+      const result = await traceResponse(
+        responseText,
+        selectedIndex,
+        (done, total) => setProgress({ done, total })
+      );
+      setTraceResult(result);
+      onTraceComplete(result);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Trace failed");
     } finally {
       setLoading(false);
     }
-  }, [responseText, selectedIndex]);
+  }, [responseText, selectedIndex, onTraceComplete]);
 
   useEffect(() => {
     if (responseText) {
@@ -62,14 +62,6 @@ export default function TracePanel({ responseText }: Props) {
     if (segment.count < 50) return "heat-1";
     if (segment.count < 500) return "heat-2";
     return "heat-3";
-  }
-
-  function heatLabel(segment: TraceSegment): string {
-    if (segment.count <= 0) return "not found";
-    if (segment.count < 5) return "rare";
-    if (segment.count < 50) return "uncommon";
-    if (segment.count < 500) return "common";
-    return "very common";
   }
 
   const stats = traceResult
@@ -121,8 +113,18 @@ export default function TracePanel({ responseText }: Props) {
           <div className="flex flex-col items-center gap-3 py-12">
             <Loader2 className="w-6 h-6 text-[var(--accent)] animate-spin" />
             <span className="text-sm text-[var(--text-muted)]">
-              Tracing response through infini-gram…
+              Tracing segments… {progress.done}/{progress.total}
             </span>
+            {progress.total > 0 && (
+              <div className="w-48 h-1.5 bg-[var(--border)] rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-[var(--accent)] rounded-full transition-all duration-300"
+                  style={{
+                    width: `${(progress.done / progress.total) * 100}%`,
+                  }}
+                />
+              </div>
+            )}
           </div>
         )}
 
@@ -160,50 +162,24 @@ export default function TracePanel({ responseText }: Props) {
               </div>
             )}
 
-            {/* Heatmap text */}
-            <div>
-              <h3 className="text-xs text-[var(--text-muted)] mb-2 uppercase tracking-wider">
-                Response Heatmap
-              </h3>
-              <div className="text-sm leading-relaxed bg-[var(--bg)] rounded-lg p-3 border border-[var(--border)]">
-                {traceResult.segments.map((seg, i) => (
-                  <span
-                    key={i}
-                    className={`cursor-pointer rounded-sm px-0.5 ${heatClass(seg)} ${
-                      expandedSegment === i
-                        ? "ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]"
-                        : ""
-                    }`}
-                    onClick={() =>
-                      setExpandedSegment(expandedSegment === i ? null : i)
-                    }
-                    title={`count: ${seg.count} | ${heatLabel(seg)}`}
-                  >
-                    {seg.text}{" "}
-                  </span>
-                ))}
-              </div>
-
-              {/* Legend */}
-              <div className="flex items-center gap-4 mt-2 text-xs text-[var(--text-muted)]">
-                <span>Click a segment for details.</span>
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-2 rounded-sm heat-0 inline-block" />{" "}
-                  rare
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-2 rounded-sm heat-1 inline-block" />{" "}
-                  uncommon
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-2 rounded-sm heat-2 inline-block" />{" "}
-                  common
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-2 rounded-sm heat-3 inline-block" />{" "}
-                  very common
-                </span>
-              </div>
+            {/* Legend */}
+            <div className="flex items-center gap-4 text-xs text-[var(--text-muted)]">
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-2 rounded-sm heat-0 inline-block" />{" "}
+                rare
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-2 rounded-sm heat-1 inline-block" />{" "}
+                uncommon
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-2 rounded-sm heat-2 inline-block" />{" "}
+                common
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-2 rounded-sm heat-3 inline-block" />{" "}
+                very common
+              </span>
             </div>
 
             {/* Segment details */}
@@ -217,6 +193,7 @@ export default function TracePanel({ responseText }: Props) {
                     key={i}
                     segment={seg}
                     index={i}
+                    heatClass={heatClass(seg)}
                     expanded={expandedSegment === i}
                     onToggle={() =>
                       setExpandedSegment(expandedSegment === i ? null : i)
@@ -255,11 +232,13 @@ function StatCard({
 function SegmentRow({
   segment,
   index,
+  heatClass,
   expanded,
   onToggle,
 }: {
   segment: TraceSegment;
   index: number;
+  heatClass: string;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -267,7 +246,7 @@ function SegmentRow({
     <div className="rounded border border-[var(--border)] overflow-hidden">
       <button
         onClick={onToggle}
-        className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-[var(--bg-card-hover)] transition-colors"
+        className={`w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-[var(--bg-card-hover)] transition-colors ${heatClass}`}
       >
         {expanded ? (
           <ChevronDown className="w-3.5 h-3.5 text-[var(--text-muted)] shrink-0" />
@@ -295,7 +274,9 @@ function SegmentRow({
             <div>
               <span className="text-[var(--text-muted)]">Probability:</span>{" "}
               <span className="font-medium">
-                {segment.prob >= 0 ? (segment.prob * 100).toFixed(2) + "%" : "N/A"}
+                {segment.prob >= 0
+                  ? (segment.prob * 100).toFixed(2) + "%"
+                  : "N/A"}
               </span>
             </div>
             <div>
