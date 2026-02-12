@@ -90,13 +90,36 @@ export default function TracePanel({ responseText, onTraceComplete }: Props) {
         <select
           value={selectedIndex}
           onChange={(e) => setSelectedIndex(e.target.value)}
-          className="text-xs px-2 py-1 rounded bg-[var(--bg)] border border-[var(--border)] outline-none"
+          className="text-xs px-2 py-1 rounded bg-[var(--bg)] border border-[var(--border)] outline-none max-w-[260px]"
         >
-          {AVAILABLE_INDEXES.map((idx) => (
-            <option key={idx.id} value={idx.id}>
-              {idx.label}
-            </option>
-          ))}
+          <optgroup label="infini-gram mini — Common Crawl">
+            {AVAILABLE_INDEXES.filter(
+              (idx) => idx.engine === "mini" && idx.id.startsWith("v2_cc")
+            ).map((idx) => (
+              <option key={idx.id} value={idx.id}>
+                {idx.label} ({idx.size})
+              </option>
+            ))}
+          </optgroup>
+          <optgroup label="infini-gram mini — Curated">
+            {AVAILABLE_INDEXES.filter(
+              (idx) =>
+                idx.engine === "mini" && !idx.id.startsWith("v2_cc")
+            ).map((idx) => (
+              <option key={idx.id} value={idx.id}>
+                {idx.label} ({idx.size})
+              </option>
+            ))}
+          </optgroup>
+          <optgroup label="infini-gram (original)">
+            {AVAILABLE_INDEXES.filter(
+              (idx) => idx.engine === "original"
+            ).map((idx) => (
+              <option key={idx.id} value={idx.id}>
+                {idx.label} ({idx.size})
+              </option>
+            ))}
+          </optgroup>
         </select>
       </div>
 

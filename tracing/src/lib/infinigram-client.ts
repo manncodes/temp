@@ -1,7 +1,7 @@
 /**
  * Client-side infini-gram tracing.
- * Calls our /api/trace Next.js route which proxies to api.infini-gram.io
- * server-side, avoiding CORS issues.
+ * Calls our /api/trace Next.js route which proxies to the appropriate
+ * infini-gram API server-side, avoiding CORS issues.
  */
 import { TraceResult } from "./types";
 

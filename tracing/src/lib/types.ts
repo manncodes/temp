@@ -46,7 +46,8 @@ export interface TraceResult {
 
 export interface InfinigramCountResult {
   count: number;
-  approx: boolean;
+  approx?: boolean;
+  latency?: number;
 }
 
 export interface InfinigramProbResult {
@@ -58,11 +59,38 @@ export interface InfinigramProbResult {
 
 export interface InfinigramSearchResult {
   cnt: number;
-  approx: boolean;
+  approx?: boolean;
   documents: TraceDocument[];
 }
 
 export interface InfinigramNtdResult {
   result_by_token_id: Record<string, number>;
-  approx: boolean;
+  approx?: boolean;
+}
+
+/** infini-gram mini find result */
+export interface InfinigramMiniFindResult {
+  cnt: number;
+  segment_by_shard: [number, number][];
+  latency: number;
+}
+
+/** infini-gram mini get_doc_by_rank result */
+export interface InfinigramMiniDocResult {
+  doc_ix: number;
+  doc_len: number;
+  disp_len: number;
+  needle_offset: number;
+  text: string;
+  latency: number;
+}
+
+/** Which engine an index belongs to */
+export type InfinigramEngine = "original" | "mini";
+
+export interface IndexEntry {
+  id: string;
+  label: string;
+  engine: InfinigramEngine;
+  size?: string;
 }
