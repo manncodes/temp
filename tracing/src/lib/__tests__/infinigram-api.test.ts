@@ -133,6 +133,8 @@ async function testMiniCountCurated() {
 
 // ─────────────────────────────────────────────
 // Test 4: Mini API – find + get_doc_by_rank (two-step doc retrieval)
+// Matches the HF Spaces reference: sends `query` with get_doc_by_rank,
+// checks for both `text` and `spans` fields in response.
 // ─────────────────────────────────────────────
 async function testMiniFindAndGetDoc() {
   const idx = "v2_cc-2025-05";
@@ -156,7 +158,7 @@ async function testMiniFindAndGetDoc() {
 
   if (findR.json.error || !findR.json.segment_by_shard) return;
 
-  // Step 2: pick first non-empty shard
+  // Step 2: Map global index 0 to shard+rank (same as HF reference)
   const shards: [number, number][] = findR.json.segment_by_shard;
   let pickedShard = -1;
   let pickedRank = -1;
@@ -173,21 +175,33 @@ async function testMiniFindAndGetDoc() {
     return;
   }
 
+  // HF reference sends `query` along with get_doc_by_rank
   const docR = await postJson(MINI_API, {
     index: idx,
     query_type: "get_doc_by_rank",
+    query,
     s: pickedShard,
     rank: pickedRank,
     max_ctx_len: 200,
   });
 
+  const hasText = typeof docR.json.text === "string";
+  const hasSpans = Array.isArray(docR.json.spans);
+  const hasMetadata = typeof docR.json.metadata === "string";
+
+  const textPreview = hasText
+    ? docR.json.text.slice(0, 120)
+    : hasSpans
+      ? docR.json.spans.map((sp: [string, string | null]) => sp[0]).join("").slice(0, 120)
+      : "(no text or spans)";
+
   record(
     `Mini get_doc_by_rank: shard=${pickedShard} rank=${pickedRank}`,
-    !docR.json.error && typeof docR.json.text === "string" && docR.json.text.length > 0,
+    !docR.json.error && (hasText || hasSpans),
     docR.json.error
       ? `ERROR: ${docR.json.error}`
-      : `doc_ix=${docR.json.doc_ix}, doc_len=${docR.json.doc_len}, preview="${(docR.json.text || "").slice(0, 120)}..."`,
-    { doc_ix: docR.json.doc_ix, doc_len: docR.json.doc_len }
+      : `doc_ix=${docR.json.doc_ix}, doc_len=${docR.json.doc_len}, hasText=${hasText}, hasSpans=${hasSpans}, hasMetadata=${hasMetadata}, preview="${textPreview}..."`,
+    { doc_ix: docR.json.doc_ix, doc_len: docR.json.doc_len, keys: Object.keys(docR.json) }
   );
 }
 

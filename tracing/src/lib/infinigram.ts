@@ -135,7 +135,10 @@ async function searchDocsOriginal(
   return result.documents || [];
 }
 
-/** Mini engine: two-step find → get_doc_by_rank */
+/**
+ * Mini engine: two-step find → get_doc_by_rank.
+ * Follows the same shard/rank mapping as the HuggingFace Spaces reference.
+ */
 async function searchDocsMini(
   text: string,
   index: string,
@@ -155,45 +158,59 @@ async function searchDocsMini(
     return [];
   }
 
-  // Step 2: get_doc_by_rank — pick up to maxDocs from different shards
-  const docs: TraceDocument[] = [];
   const shards = findResult.segment_by_shard;
+  const cnt = findResult.cnt;
 
-  // Collect candidate (shard, rank) pairs spread across shards
-  const candidates: { s: number; rank: number }[] = [];
-  for (let s = 0; s < shards.length; s++) {
-    const [lo, hi] = shards[s];
-    if (hi > lo) {
-      // Pick first match in this shard
-      candidates.push({ s, rank: lo });
-      // If the shard has many matches, also pick one from the middle
-      if (hi - lo > 2) {
-        candidates.push({ s, rank: lo + Math.floor((hi - lo) / 2) });
+  // Map a flat global index → (shard, rank), same as HF reference:
+  //   cnt_by_shard = [end - start for (start, end) in segment_by_shard]
+  //   walk through shards until idx falls within the shard's range
+  function globalToShardRank(globalIdx: number): { s: number; rank: number } {
+    let remaining = globalIdx;
+    for (let s = 0; s < shards.length; s++) {
+      const shardCnt = shards[s][1] - shards[s][0];
+      if (remaining < shardCnt) {
+        return { s, rank: shards[s][0] + remaining };
       }
+      remaining -= shardCnt;
     }
+    return { s: 0, rank: shards[0][0] };
   }
 
-  // Fetch up to maxDocs
-  const toFetch = candidates.slice(0, maxDocs);
+  // Pick spread-out indices (first, random from middle, last)
+  const indices: number[] = [0];
+  if (cnt > 1 && maxDocs > 1) {
+    indices.push(Math.floor(cnt / 2));
+  }
+  if (cnt > 2 && maxDocs > 2) {
+    indices.push(cnt - 1);
+  }
 
   const fetched = await Promise.all(
-    toFetch.map(async ({ s, rank }) => {
+    indices.slice(0, maxDocs).map(async (globalIdx) => {
+      const { s, rank } = globalToShardRank(globalIdx);
       try {
-        const doc: InfinigramMiniDocResult = await queryRaw(
-          INFINIGRAM_MINI_API,
-          {
-            index,
-            query_type: "get_doc_by_rank",
-            s,
-            rank,
-            max_ctx_len: 500,
-          }
-        );
+        // HF reference sends `query` along with get_doc_by_rank
+        const doc = await queryRaw(INFINIGRAM_MINI_API, {
+          index,
+          query_type: "get_doc_by_rank",
+          query: text,
+          s,
+          rank,
+          max_ctx_len: 500,
+        });
+        // Response may have `text` (per docs) or `spans` (per HF reference)
+        const passage =
+          typeof doc.text === "string"
+            ? doc.text
+            : Array.isArray(doc.spans)
+              ? doc.spans.map((sp: [string, string | null]) => sp[0]).join("")
+              : "";
         return {
           doc_ix: doc.doc_ix,
           doc_len: doc.doc_len,
           disp_len: doc.disp_len,
-          passage: doc.text,
+          passage,
+          metadata: doc.metadata,
         } satisfies TraceDocument;
       } catch {
         return null;
@@ -201,10 +218,10 @@ async function searchDocsMini(
     })
   );
 
+  const docs: TraceDocument[] = [];
   for (const d of fetched) {
     if (d) docs.push(d);
   }
-
   return docs;
 }
 
